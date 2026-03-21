@@ -14,4 +14,4 @@ aave-flashbot-bot/out/
 aave-flashbot-bot/cache/
 .env
 
-aave-flashbot-bot/lib
+aave-flashbot-bot/lib/

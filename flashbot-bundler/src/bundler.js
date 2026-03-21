@@ -2,10 +2,13 @@
  * bundler.js
  *
  * Core engine for Person C — the Flashbots integration layer.
+ * Supports multiple MEV strategies:
+ *   - Aave V3 Liquidations (mode 1)
+ *   - DEX Arbitrage across Uniswap V3 fee tiers (mode 2)
  *
  * 5 Jobs:
- *   1. Listen for liquidation signals from Person B's watcher
- *   2. Encode the executeLiquidation() transaction using Person A's ABI
+ *   1. Listen for liquidation + arbitrage signals
+ *   2. Encode the appropriate contract call using Person A's ABI
  *   3. Simulate via Flashbots eth_callBundle before sending
  *   4. Calculate builder tip and build the bundle for block N and N+1
  *   5. Sign and send via FlashbotsBundleProvider
@@ -13,6 +16,7 @@
  * Usage:
  *   node src/bundler.js                          — runs with live watcher
  *   MOCK_MODE=true node src/bundler.js           — runs with a mock signal for testing
+ *   MOCK_ARB=true node src/bundler.js            — runs with a mock arbitrage signal
  */
 
 require("dotenv").config();
@@ -25,7 +29,8 @@ const { EventEmitter } = require("events");
 const path = require("path");
 const fs = require("fs");
 
-const { calculateProfit, CONTRACT_ADDRESS, CONFIG } = require("./profitCalculator");
+const { calculateProfit, CONTRACT_ADDRESS, CONFIG, SEPOLIA_WETH, SEPOLIA_USDC } = require("./profitCalculator");
+const { calculateArbProfit, SEPOLIA_ADDRESSES } = require("./arbCalculator");
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -53,6 +58,9 @@ const state = {
     bundlesLanded: 0,
     bundlesFailed: 0,
     lastLiquidation: null,
+    lastArbitrage: null,
+    totalLiquidations: 0,
+    totalArbitrages: 0,
     isRunning: false,
     logs: [],
 };
@@ -66,41 +74,22 @@ function log(msg) {
 }
 
 // ---------------------------------------------------------------------------
-// Job 1 — Listen for liquidation signals
+// Job 1 — Listen for signals
 // ---------------------------------------------------------------------------
 
-/**
- * The signal bus. Person B's watcher emits "liquidation" events on this.
- * If running in separate processes, replace EventEmitter with a WebSocket
- * or Redis pub/sub connection.
- */
 const signalBus = new EventEmitter();
 
-/**
- * Mock signal for local testing — use when Person B's watcher isn't ready.
- * Run with MOCK_MODE=true to fire a test signal after startup.
- *
- * Signal shape (agreed with Person B):
- * {
- *   borrower:         "0x...",   — the underwater user
- *   debtAsset:        "0x...",   — token they borrowed (e.g., USDC)
- *   collateralAsset:  "0x...",   — token they put up (e.g., WETH)
- *   maxDebtToRepay:   "...",     — raw amount in smallest unit
- *   collateralAmount: "...",     — estimated collateral to seize
- *   healthFactor:     "0.94"     — for logging
- * }
- */
-function emitMockSignal() {
+function emitMockLiquidationSignal() {
     const mockSignal = {
         borrower: "0x1000000000000000000000000000000000000000",
-        debtAsset: "0x94a9d9ac8a22534e3faca9f4e7f2e2cf85d5e4c8",      // USDC on Sepolia
-        collateralAsset: "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9",  // WETH on Sepolia
-        maxDebtToRepay: "500000000",          // 500 USDC (6 decimals)
-        collateralAmount: "310000000000000000", // 0.31 WETH (18 decimals)
+        debtAsset: SEPOLIA_USDC,
+        collateralAsset: SEPOLIA_WETH,
+        maxDebtToRepay: "500000000",
+        collateralAmount: "310000000000000000",
         healthFactor: "0.94",
     };
 
-    log("🧪 MOCK MODE: Emitting test liquidation signal...");
+    log("MOCK MODE: Emitting test liquidation signal...");
     log(`   Borrower: ${mockSignal.borrower}`);
     log(`   Debt: USDC ${Number(mockSignal.maxDebtToRepay) / 1e6}`);
     log(`   Collateral: WETH ${Number(mockSignal.collateralAmount) / 1e18}`);
@@ -109,54 +98,67 @@ function emitMockSignal() {
     signalBus.emit("liquidation", mockSignal);
 }
 
+function emitMockArbSignal() {
+    const mockSignal = {
+        type: "arbitrage",
+        tokenIn: SEPOLIA_WETH,
+        tokenOut: SEPOLIA_USDC,
+        amountIn: ethers.parseEther("0.05").toString(),
+        dexA: SEPOLIA_ADDRESSES.SWAP_ROUTER_02,
+        dexB: SEPOLIA_ADDRESSES.SWAP_ROUTER_02,
+        buyFee: 500,
+        sellFee: 3000,
+        expectedProfitRaw: "100000000000000",
+    };
+
+    log("MOCK MODE: Emitting test arbitrage signal...");
+    log(`   Token In: ${mockSignal.tokenIn}`);
+    log(`   Token Out: ${mockSignal.tokenOut}`);
+    log(`   Amount: ${ethers.formatEther(mockSignal.amountIn)} WETH`);
+    log(`   Buy pool: ${mockSignal.buyFee / 100}% fee tier`);
+    log(`   Sell pool: ${mockSignal.sellFee / 100}% fee tier`);
+
+    signalBus.emit("arbitrage", mockSignal);
+}
+
 // ---------------------------------------------------------------------------
-// Job 2 — Encode the transaction
+// Job 2 — Encode the transaction (supports both strategies)
 // ---------------------------------------------------------------------------
 
-/**
- * Encodes the executeLiquidation() call using Person A's contract ABI.
- *
- * @param {object} signal - liquidation signal from Person B
- * @param {object} profitAnalysis - output from profitCalculator
- * @returns {string} ABI-encoded calldata
- */
-function encodeLiquidationTx(signal, profitAnalysis) {
-    const iface = new ethers.Interface(ABI);
+const iface = new ethers.Interface(ABI);
 
-    // Convert recommended tip to a minProfit value in the debt token's units.
-    // The contract reverts if leftover profit < minProfit, so we set it
-    // conservatively to 0 for hackathon testing. 
-    // In production: set this to the minimum acceptable raw token amount.
+function encodeLiquidationTx(signal) {
     const minProfit = 0;
-
-    // Uniswap V3 pool fee tier — 3000 = 0.3%
     const poolFee = 3000;
 
-    const calldata = iface.encodeFunctionData("executeLiquidation", [
+    return iface.encodeFunctionData("executeLiquidation", [
         signal.collateralAsset,
         signal.debtAsset,
         signal.borrower,
         signal.maxDebtToRepay,
-        false,       // receiveAToken = false (receive underlying collateral)
+        false,
         minProfit,
         poolFee,
     ]);
+}
 
-    return calldata;
+function encodeArbitrageTx(signal) {
+    const minProfit = 0;
+
+    return iface.encodeFunctionData("executeArbitrage", [
+        signal.tokenIn,
+        signal.tokenOut,
+        signal.amountIn,
+        signal.dexA,
+        signal.dexB,
+        minProfit,
+    ]);
 }
 
 // ---------------------------------------------------------------------------
 // Job 3 — Simulate via Flashbots before sending
 // ---------------------------------------------------------------------------
 
-/**
- * Simulates the bundle against the current block to check if it would revert.
- *
- * @param {FlashbotsBundleProvider} flashbotsProvider
- * @param {object} signedBundle - the signed bundle transactions
- * @param {number} targetBlock - the block number to simulate against
- * @returns {Promise<object|null>} simulation result, or null if failed
- */
 async function simulateBundle(flashbotsProvider, signedBundle, targetBlock) {
     log(` Simulating bundle for block ${targetBlock}...`);
 
@@ -182,42 +184,31 @@ async function simulateBundle(flashbotsProvider, signedBundle, targetBlock) {
 }
 
 // ---------------------------------------------------------------------------
-// Job 4 & 5 — Build, sign, and send the bundle
+// Job 4 & 5 — Build, sign, and send the bundle (strategy-agnostic)
 // ---------------------------------------------------------------------------
 
-/**
- * Builds, signs, and sends a Flashbots bundle targeting block N and N+1.
- *
- * @param {object} signal - liquidation signal
- * @param {object} profitAnalysis - from profitCalculator
- * @param {ethers.Wallet} wallet - the contract owner wallet (signs the tx)
- * @param {ethers.Provider} provider - JSON-RPC provider
- * @param {FlashbotsBundleProvider} flashbotsProvider - Flashbots relay connection
- */
 async function buildAndSendBundle(
-    signal,
+    calldata,
+    strategyName,
     profitAnalysis,
+    signal,
     wallet,
     provider,
     flashbotsProvider
 ) {
-    const calldata = encodeLiquidationTx(signal, profitAnalysis);
-
-    // Get current gas values
     const block = await provider.getBlock("latest");
     const baseFee = block.baseFeePerGas;
     const priorityFee = ethers.parseUnits(PRIORITY_FEE_GWEI, "gwei");
-    const maxFeePerGas = baseFee * 2n + priorityFee; // 2x baseFee buffer for next block
+    const maxFeePerGas = baseFee * 2n + priorityFee;
     const currentBlock = block.number;
 
     state.currentBlock = currentBlock;
 
-    log(`  Building bundle...`);
+    log(`  Building ${strategyName} bundle...`);
     log(`   Contract: ${CONTRACT_ADDRESS}`);
     log(`   BaseFee: ${ethers.formatUnits(baseFee, "gwei")} gwei`);
     log(`   MaxFeePerGas: ${ethers.formatUnits(maxFeePerGas, "gwei")} gwei`);
 
-    // Target two consecutive blocks for latency tolerance
     const targetBlocks = [currentBlock + 1, currentBlock + 2];
 
     for (const targetBlock of targetBlocks) {
@@ -236,13 +227,8 @@ async function buildAndSendBundle(
             },
         ];
 
-        // ---- Job 3: Simulate first ----
         const signedBundle = await flashbotsProvider.signBundle(bundleTransactions);
-        const simulation = await simulateBundle(
-            flashbotsProvider,
-            signedBundle,
-            targetBlock
-        );
+        const simulation = await simulateBundle(flashbotsProvider, signedBundle, targetBlock);
 
         if (!simulation) {
             log(`  Skipping block ${targetBlock} — simulation failed`);
@@ -250,12 +236,8 @@ async function buildAndSendBundle(
             continue;
         }
 
-        // ---- Job 5: Send the bundle ----
         log(` Sending bundle for block ${targetBlock}...`);
-        const bundleResponse = await flashbotsProvider.sendRawBundle(
-            signedBundle,
-            targetBlock
-        );
+        const bundleResponse = await flashbotsProvider.sendRawBundle(signedBundle, targetBlock);
 
         if ("error" in bundleResponse) {
             log(` Bundle send error: ${bundleResponse.error.message}`);
@@ -266,22 +248,34 @@ async function buildAndSendBundle(
         state.bundlesSent++;
         log(` Bundle sent! Hash: ${bundleResponse.bundleHash}`);
 
-        // Wait for the bundle to be included (or not)
         const resolution = await bundleResponse.wait();
 
         switch (resolution) {
             case FlashbotsBundleResolution.BundleIncluded:
                 log(` BUNDLE INCLUDED in block ${targetBlock}!`);
                 state.bundlesLanded++;
-                state.lastLiquidation = {
-                    timestamp: new Date().toISOString(),
-                    targetBlock,
-                    borrower: signal.borrower,
-                    profitETH: profitAnalysis.netProfitETH,
-                    profitUSD: profitAnalysis.netProfitUSD,
-                    bundleHash: bundleResponse.bundleHash,
-                };
-                return; // done — no need to try the next block
+
+                if (strategyName === "liquidation") {
+                    state.totalLiquidations++;
+                    state.lastLiquidation = {
+                        timestamp: new Date().toISOString(),
+                        targetBlock,
+                        borrower: signal.borrower,
+                        profitETH: profitAnalysis.netProfitETH,
+                        bundleHash: bundleResponse.bundleHash,
+                    };
+                } else if (strategyName === "arbitrage") {
+                    state.totalArbitrages++;
+                    state.lastArbitrage = {
+                        timestamp: new Date().toISOString(),
+                        targetBlock,
+                        tokenIn: signal.tokenIn,
+                        tokenOut: signal.tokenOut,
+                        profitETH: profitAnalysis.netProfitETH,
+                        bundleHash: bundleResponse.bundleHash,
+                    };
+                }
+                return;
 
             case FlashbotsBundleResolution.BlockPassedWithoutInclusion:
                 log(` Block ${targetBlock} passed without inclusion, trying next...`);
@@ -300,10 +294,10 @@ async function buildAndSendBundle(
 }
 
 // ---------------------------------------------------------------------------
-// Main pipeline — ties all 5 jobs together
+// Main pipelines — one per strategy
 // ---------------------------------------------------------------------------
 
-async function handleSignal(signal, wallet, provider, flashbotsProvider) {
+async function handleLiquidationSignal(signal, wallet, provider, flashbotsProvider) {
     log(`\n${"=".repeat(60)}`);
     log(` LIQUIDATION SIGNAL RECEIVED`);
     log(`   Borrower: ${signal.borrower}`);
@@ -313,8 +307,7 @@ async function handleSignal(signal, wallet, provider, flashbotsProvider) {
     log(`${"=".repeat(60)}`);
 
     try {
-        // Step 1: Check profitability
-        log(`\ Calculating profitability...`);
+        log(` Calculating profitability...`);
         const profitAnalysis = await calculateProfit(signal, provider);
 
         log(`   Gross profit: $${profitAnalysis.grossProfitUSD} (${profitAnalysis.grossProfitETH} ETH)`);
@@ -325,16 +318,54 @@ async function handleSignal(signal, wallet, provider, flashbotsProvider) {
 
         if (!profitAnalysis.isWorthIt) {
             log(`\n NOT PROFITABLE — skipping this liquidation.`);
-            log(`   Net profit ${profitAnalysis.netProfitETH} ETH < threshold ${CONFIG.MIN_PROFIT_THRESHOLD_ETH} ETH`);
             return;
         }
 
         log(`\n PROFITABLE — proceeding to bundle...`);
-
-        // Step 2–5: Encode, simulate, build, send
-        await buildAndSendBundle(signal, profitAnalysis, wallet, provider, flashbotsProvider);
+        const calldata = encodeLiquidationTx(signal);
+        await buildAndSendBundle(calldata, "liquidation", profitAnalysis, signal, wallet, provider, flashbotsProvider);
     } catch (err) {
-        log(`\n ERROR processing signal: ${err.message}`);
+        log(`\n ERROR processing liquidation: ${err.message}`);
+        console.error(err);
+    }
+}
+
+async function handleArbSignal(signal, wallet, provider, flashbotsProvider) {
+    log(`\n${"=".repeat(60)}`);
+    log(` ARBITRAGE SIGNAL RECEIVED`);
+    log(`   Token In: ${signal.tokenIn}`);
+    log(`   Token Out: ${signal.tokenOut}`);
+    log(`   Amount: ${ethers.formatEther(signal.amountIn)} tokens`);
+    log(`   Buy pool: ${signal.buyFee / 100}% fee tier`);
+    log(`   Sell pool: ${signal.sellFee / 100}% fee tier`);
+    log(`${"=".repeat(60)}`);
+
+    try {
+        log(` Calculating arb profitability...`);
+        const profitAnalysis = await calculateArbProfit(
+            {
+                profitRaw: BigInt(signal.expectedProfitRaw),
+                amountIn: BigInt(signal.amountIn),
+            },
+            provider
+        );
+
+        log(`   Gross profit: ${profitAnalysis.grossProfitETH} ETH`);
+        log(`   Gas cost:     ${profitAnalysis.gasCostETH} ETH`);
+        log(`   Net profit:   ${profitAnalysis.netProfitETH} ETH`);
+        log(`   Builder tip:  ${profitAnalysis.recommendedTipETH} ETH`);
+        log(`   Keeper keeps: ${profitAnalysis.keeperProfitETH} ETH`);
+
+        if (!profitAnalysis.isWorthIt) {
+            log(`\n NOT PROFITABLE — skipping this arbitrage.`);
+            return;
+        }
+
+        log(`\n PROFITABLE — proceeding to bundle...`);
+        const calldata = encodeArbitrageTx(signal);
+        await buildAndSendBundle(calldata, "arbitrage", profitAnalysis, signal, wallet, provider, flashbotsProvider);
+    } catch (err) {
+        log(`\n ERROR processing arbitrage: ${err.message}`);
         console.error(err);
     }
 }
@@ -344,7 +375,8 @@ async function handleSignal(signal, wallet, provider, flashbotsProvider) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-    log(" Aave Flashbot Bundler starting...");
+    log(" MEV Bundler starting...");
+    log(`   Strategies: Liquidation + DEX Arbitrage`);
     log(`   Network: Sepolia (chain ${SEPOLIA_CHAIN_ID})`);
     log(`   Contract: ${CONTRACT_ADDRESS}`);
     log(`   Relay: ${FLASHBOTS_RELAY_SEPOLIA}`);
@@ -368,13 +400,10 @@ async function main() {
         process.exit(1);
     }
 
-    // Wallet setup — two separate keys for two separate purposes
-    // PRIVATE_KEY = contract owner, signs the actual liquidation tx
+    // Wallet setup
     const ownerWallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
     log(`   Owner wallet: ${ownerWallet.address}`);
 
-    // FLASHBOTS_AUTH_KEY = relay signing key, identifies you to the Flashbots relay
-    // This is NOT your money key — it's a throwaway key for relay authentication
     const relaySigningWallet = new ethers.Wallet(process.env.FLASHBOTS_AUTH_KEY);
     log(`   Relay signer: ${relaySigningWallet.address}`);
 
@@ -395,23 +424,29 @@ async function main() {
         log(`  WARNING: Owner has 0 ETH — transactions will fail!`);
     }
 
-    // Register signal handler (Job 1)
+    // Register signal handlers — Job 1 (both strategies)
     signalBus.on("liquidation", (signal) => {
-        handleSignal(signal, ownerWallet, provider, flashbotsProvider);
+        handleLiquidationSignal(signal, ownerWallet, provider, flashbotsProvider);
+    });
+
+    signalBus.on("arbitrage", (signal) => {
+        handleArbSignal(signal, ownerWallet, provider, flashbotsProvider);
     });
 
     state.isRunning = true;
-    log(`\n Bundler is LIVE — listening for liquidation signals...\n`);
+    log(`\n Bundler is LIVE — listening for liquidation + arbitrage signals...\n`);
 
-    // If running in mock mode, fire a test signal after 2 seconds
+    // Mock modes for testing
     if (process.env.MOCK_MODE === "true") {
-        setTimeout(() => emitMockSignal(), 2000);
+        setTimeout(() => emitMockLiquidationSignal(), 2000);
+    }
+    if (process.env.MOCK_ARB === "true") {
+        setTimeout(() => emitMockArbSignal(), 2000);
     }
 
     // Keep the process alive — track new blocks
     provider.on("block", (blockNumber) => {
         state.currentBlock = blockNumber;
-        // Log every 10th block to avoid spam
         if (blockNumber % 10 === 0) {
             log(` Block ${blockNumber}`);
         }
@@ -419,14 +454,17 @@ async function main() {
 }
 
 // ---------------------------------------------------------------------------
-// Exports — signalBus and state are shared with watcher and dashboard
+// Exports
 // ---------------------------------------------------------------------------
 
 module.exports = {
     signalBus,
     state,
-    handleSignal,
+    main,
+    handleLiquidationSignal,
+    handleArbSignal,
     encodeLiquidationTx,
+    encodeArbitrageTx,
     simulateBundle,
     buildAndSendBundle,
 };

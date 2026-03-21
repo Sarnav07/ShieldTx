@@ -1,13 +1,13 @@
 //SPDX-License-Identifier: MIT
 pragma solidity ^0.8.30;
 
-import {Script} from "../lib/forge-std/src/Script.sol";
+import {Script, console} from "../lib/forge-std/src/Script.sol";
 import {IPool} from "../src/interfaces/IAavePool.sol";
 
 contract FindLiquidatable is Script {
     address constant AAVE_POOL = 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2;
 
-    address[] candidates = [];
+    address[] candidates;
 
     function run() external view {
         IPool pool = IPool(AAVE_POOL);

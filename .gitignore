@@ -1,0 +1,17 @@
+# Foundry auto-generated directories
+broadcast/
+cache/
+out/
+
+# Environment variables (Crucial for keeping your private keys safe!)
+.env
+
+# Node dependencies (if you are using any npm packages)
+node_modules/
+
+aave-flashbot-bot/broadcast/
+aave-flashbot-bot/out/
+aave-flashbot-bot/cache/
+.env
+
+aave-flashbot-bot/lib

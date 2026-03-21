@@ -2,7 +2,7 @@
 pragma solidity ^0.8.20;
 
 interface ISwapRouter {
-    struct ExactOutputSimpleParams {
+    struct ExactOutputSingleParams {
         address tokenIn;
         address tokenOut;
         uint24 fee;
@@ -10,10 +10,10 @@ interface ISwapRouter {
         uint256 deadline;
         uint256 amountOut;
         uint256 amountInMaximum;
-        uint160 sqrtPriceX96After;
+        uint160 sqrtPriceLimitX96;
     }
 
-    function exactOutputSimple(
-        ExactOutputSimpleParams calldata params
+    function exactOutputSingle(
+        ExactOutputSingleParams calldata params
     ) external payable returns (uint256 amountIn);
 }

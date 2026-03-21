@@ -1,12 +1,36 @@
 [
   {
     "type": "constructor",
-    "inputs": [],
+    "inputs": [
+      {
+        "name": "_aavePool",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "_uniswapRouter",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
     "stateMutability": "nonpayable"
   },
   {
     "type": "receive",
     "stateMutability": "payable"
+  },
+  {
+    "type": "function",
+    "name": "AAVE_POOL",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "stateMutability": "view"
   },
   {
     "type": "function",
@@ -36,6 +60,19 @@
   },
   {
     "type": "function",
+    "name": "UNISWAP_ROUTER",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "aavePool",
     "inputs": [],
     "outputs": [
@@ -46,6 +83,44 @@
       }
     ],
     "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "executeArbitrage",
+    "inputs": [
+      {
+        "name": "tokenIn",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "tokenOut",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "amountIn",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "dexA",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "dexB",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "minProfit",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
   },
   {
     "type": "function",
@@ -85,6 +160,56 @@
         "name": "poolFee",
         "type": "uint24",
         "internalType": "uint24"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "executeMultipleLiquidation",
+    "inputs": [
+      {
+        "name": "params",
+        "type": "tuple[]",
+        "internalType": "struct AaveLiquidator.LiquidationParams[]",
+        "components": [
+          {
+            "name": "collateralAsset",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "debtAsset",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "user",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "debtAmount",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "receiveAToken",
+            "type": "bool",
+            "internalType": "bool"
+          },
+          {
+            "name": "minProfit",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "poolFee",
+            "type": "uint24",
+            "internalType": "uint24"
+          }
+        ]
       }
     ],
     "outputs": [],
@@ -144,6 +269,50 @@
   },
   {
     "type": "function",
+    "name": "simulateLiquidation",
+    "inputs": [
+      {
+        "name": "collateralAsset",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "debtAsset",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "user",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "debtAmount",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "expectedProfit",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "flashLoanFee",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "isProfitable",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "withdraw",
     "inputs": [
       {
@@ -161,6 +330,31 @@
     "inputs": [],
     "outputs": [],
     "stateMutability": "nonpayable"
+  },
+  {
+    "type": "event",
+    "name": "ArbitrageExecuted",
+    "inputs": [
+      {
+        "name": "tokenIn",
+        "type": "address",
+        "indexed": false,
+        "internalType": "address"
+      },
+      {
+        "name": "tokenOut",
+        "type": "address",
+        "indexed": false,
+        "internalType": "address"
+      },
+      {
+        "name": "profit",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
   },
   {
     "type": "event",

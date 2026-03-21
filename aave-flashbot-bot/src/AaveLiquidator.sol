@@ -8,6 +8,11 @@ import {IPoolAddressesProvider} from "./interfaces/IPoolAddressesProvider.sol";
 import {ISwapRouter} from "./interfaces/ISwapRouter.sol";
 
 contract AaveLiquidator is IFlashLoanSimpleReceiver {
+    // IMMUTABLES
+
+    address public immutable AAVE_POOL;
+    address public immutable UNISWAP_ROUTER;
+
     // ERRORS
 
     error AaveLiquidator__NotAavePool();
@@ -20,12 +25,6 @@ contract AaveLiquidator is IFlashLoanSimpleReceiver {
     address public owner;
     IPool public aavePool;
 
-    // CONSTANTS
-
-    address constant AAVE_POOL = 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2;
-    address constant UNISWAP_ROUTER =
-        0xE592427A0AEce92De3Edee1F18E0157C05861564;
-
     // EVENTS
 
     event LiquidationExecuted(
@@ -35,16 +34,60 @@ contract AaveLiquidator is IFlashLoanSimpleReceiver {
         uint256 profit
     );
 
+    event ArbitrageExecuted(address tokenIn, address tokenOut, uint256 profit);
+
+    // STRUCT
+
+    struct LiquidationParams {
+        address collateralAsset;
+        address debtAsset;
+        address user;
+        uint256 debtAmount;
+        bool receiveAToken;
+        uint256 minProfit;
+        uint24 poolFee;
+    }
+
     // CONSTRUCTOR
 
-    constructor() {
+    constructor(address _aavePool, address _uniswapRouter) {
         owner = msg.sender;
-        aavePool = IPool(AAVE_POOL);
+        AAVE_POOL = _aavePool;
+        UNISWAP_ROUTER = _uniswapRouter;
+        aavePool = IPool(_aavePool);
     }
 
     modifier onlyOwner() {
         require(msg.sender == owner, "Not Owner");
         _;
+    }
+
+    function executeMultipleLiquidation(
+        LiquidationParams[] calldata params
+    ) external onlyOwner {
+        for (uint i = 0; i < params.length; i++) {
+            LiquidationParams memory p = params[i];
+            // mode 1 = liquidation, encode all 5 values that executeOperation expects
+            bytes memory data = abi.encode(
+                uint8(1),
+                p.collateralAsset,
+                p.user,
+                p.receiveAToken,
+                p.minProfit,
+                p.poolFee
+            );
+            aavePool.flashLoanSimple(
+                address(this),
+                p.debtAsset,
+                p.debtAmount,
+                data,
+                0
+            );
+        }
+
+        if (address(this).balance > 0) {
+            block.coinbase.transfer(address(this).balance / 2);
+        }
     }
 
     function executeLiquidation(
@@ -56,7 +99,9 @@ contract AaveLiquidator is IFlashLoanSimpleReceiver {
         uint256 minProfit,
         uint24 poolFee
     ) external onlyOwner {
+        // mode 1 = liquidation
         bytes memory params = abi.encode(
+            uint8(1),
             collateralAsset,
             user,
             receiveAToken,
@@ -78,7 +123,8 @@ contract AaveLiquidator is IFlashLoanSimpleReceiver {
         }
     }
 
-    /// flash loan callback , aave calls this automatically mid-flash-loan
+    /// flash loan callback — Aave calls this automatically mid-flash-loan
+    /// Uses mode byte to dispatch: 1 = liquidation, 2 = arbitrage
 
     function executeOperation(
         address asset,
@@ -91,13 +137,59 @@ contract AaveLiquidator is IFlashLoanSimpleReceiver {
             revert AaveLiquidator__NotAavePool();
         }
 
+        uint8 mode = abi.decode(params, (uint8));
+
+        if (mode == 1) {
+            _handleLiquidation(asset, amount, premium, params);
+        } else if (mode == 2) {
+            _handleArbitrage(asset, amount, premium, params);
+        } else {
+            revert("Unknown mode");
+        }
+
+        return true;
+    }
+
+    function executeArbitrage(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        address dexA, // buy here cheap
+        address dexB, // sell here expensive
+        uint256 minProfit
+    ) external onlyOwner {
+        // mode 2 = arbitrage
+        bytes memory params = abi.encode(
+            uint8(2),
+            tokenOut,
+            dexA,
+            dexB,
+            minProfit
+        );
+        aavePool.flashLoanSimple(address(this), tokenIn, amountIn, params, 0);
+
+        if (address(this).balance > 0) {
+            block.coinbase.transfer(address(this).balance / 2);
+        }
+    }
+
+    function _handleLiquidation(
+        address asset,
+        uint256 amount,
+        uint256 premium,
+        bytes calldata params
+    ) internal {
         (
+            ,
             address collateralAsset,
             address user,
             bool receiveAToken,
             uint256 minProfit,
             uint24 poolFee
-        ) = abi.decode(params, (address, address, bool, uint256, uint24));
+        ) = abi.decode(
+                params,
+                (uint8, address, address, bool, uint256, uint24)
+            );
 
         // step 1: approve Aave to pull debt tokens for liquidationCall
         IERC20(asset).approve(AAVE_POOL, amount);
@@ -115,18 +207,75 @@ contract AaveLiquidator is IFlashLoanSimpleReceiver {
         uint256 repayAmount = amount + premium;
         _swapCollateralForDebt(collateralAsset, asset, repayAmount, poolFee);
 
-        // step 4: approve Aave to pull back (amount + premium) for flash loan repayment
+        // step 4: approve Aave to pull back (amount + premium)
         IERC20(asset).approve(AAVE_POOL, repayAmount);
 
-        // step 5: verify profitability — revert the entire tx if not worth it
+        // step 5: verify profitability
         uint256 profit = IERC20(asset).balanceOf(address(this));
         if (profit < minProfit) {
             revert AaveLiquidator__NotProfitable(profit, minProfit);
         }
 
         emit LiquidationExecuted(user, asset, collateralAsset, profit);
+    }
 
-        return true;
+    /// @dev Handles arbitrage flow inside flash loan callback
+    function _handleArbitrage(
+        address asset,
+        uint256 amount,
+        uint256 premium,
+        bytes calldata params
+    ) internal {
+        (
+            ,
+            address tokenOut,
+            address dexA,
+            address dexB,
+            uint256 minProfit
+        ) = abi.decode(params, (uint8, address, address, address, uint256));
+
+        uint256 repayAmount = amount + premium;
+
+        // step 1: swap tokenIn → tokenOut on dexA (buy cheap)
+        IERC20(asset).approve(dexA, amount);
+        _swapOnDex(dexA, asset, tokenOut, amount);
+
+        // step 2: swap tokenOut → tokenIn on dexB (sell expensive)
+        uint256 tokenOutBal = IERC20(tokenOut).balanceOf(address(this));
+        IERC20(tokenOut).approve(dexB, tokenOutBal);
+        _swapOnDex(dexB, tokenOut, asset, tokenOutBal);
+
+        // step 3: approve Aave for repayment
+        IERC20(asset).approve(AAVE_POOL, repayAmount);
+
+        // step 4: verify profitability
+        uint256 profit = IERC20(asset).balanceOf(address(this)) - repayAmount;
+        if (profit < minProfit) {
+            revert AaveLiquidator__NotProfitable(profit, minProfit);
+        }
+
+        emit ArbitrageExecuted(asset, tokenOut, profit);
+    }
+
+    /// @dev Swap via any Uniswap V3-compatible router
+    function _swapOnDex(
+        address dex,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn
+    ) internal {
+        ISwapRouter(dex).exactOutputSingle(
+            ISwapRouter.ExactOutputSingleParams({
+                tokenIn: tokenIn,
+                tokenOut: tokenOut,
+                fee: 3000,
+                recipient: address(this),
+                deadline: block.timestamp,
+                amountOut: 0, // will be set by router
+                amountInMaximum: amountIn,
+                sqrtPriceLimitX96: 0
+            })
+        );
     }
 
     /// @dev Internal helper to swap collateral for debt token. Separated to avoid stack-too-deep.
@@ -183,6 +332,34 @@ contract AaveLiquidator is IFlashLoanSimpleReceiver {
             revert AaveLiquidator__NothingToWithdraw();
         }
         payable(owner).transfer(address(this).balance);
+    }
+
+    function simulateLiquidation(
+        address collateralAsset,
+        address debtAsset,
+        address user,
+        uint256 debtAmount
+    )
+        external
+        view
+        returns (
+            uint256 expectedProfit,
+            uint256 flashLoanFee,
+            bool isProfitable
+        )
+    {
+        flashLoanFee = (debtAmount * 5) / 10000; // 0.05% Aave flash loan fee
+
+        // Default liquidation bonus is ~5% for most assets
+        // In production, extract from aavePool.getConfiguration() bitmap
+        uint256 liquidationBonus = 10500; // 105% = 5% bonus
+
+        uint256 collateralReceived = (debtAmount * liquidationBonus) / 10000;
+
+        if (collateralReceived > debtAmount + flashLoanFee) {
+            expectedProfit = collateralReceived - (debtAmount + flashLoanFee);
+            isProfitable = true;
+        }
     }
 
     receive() external payable {}

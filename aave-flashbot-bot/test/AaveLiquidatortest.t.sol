@@ -20,7 +20,10 @@ contract AaveLiquidatorTest is Test {
     function setUp() public {
         // fork mainnet at known block
         vm.createSelectFork(vm.envString("ALCHEMY_RPC_URL"), 19500000);
-        liquidator = new AaveLiquidator();
+        liquidator = new AaveLiquidator(
+            0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2, // mainnet Aave
+            0xE592427A0AEce92De3Edee1F18E0157C05861564 // mainnet Uniswap
+        );
     }
 
     function test_OwnerIsDeployer() public view {

@@ -307,10 +307,8 @@ function toArbSignal(opportunity) {
         tokenIn: opportunity.tokenIn,
         tokenOut: opportunity.tokenOut,
         amountIn: opportunity.amountIn.toString(),
-        dexA: opportunity.dexA,
-        dexB: opportunity.dexB,
-        buyFee: opportunity.buyFee,
-        sellFee: opportunity.sellFee,
+        buyOnUniswap: true, // Assuming the buy leg is on Uniswap for this placeholder logic
+        uniswapFee: opportunity.buyFee,
         expectedProfitRaw: opportunity.profitRaw.toString(),
     };
 }

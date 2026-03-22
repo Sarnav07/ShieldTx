@@ -1,40 +1,109 @@
 require("dotenv").config();
 const { ethers } = require("ethers");
-const { AAVE_POOL_ADDRESS } = require("./constants");
-const { AAVE_POOL_ABI } = require("./constants");
 
+const {
+    AAVE_ORACLE_ADDRESS,
+    AAVE_ORACLE_ABI,
+    AAVE_POOL_ADDRESS,
+    AAVE_POOL_ABI,
+    HF_LIQUIDATABLE,
+    HF_DANGER_ZONE,
+    TOKENS,
+} = require("./constants");
+
+const {
+    parseAccountData,
+    formatHF,
+    pickBestCollateral,
+    pickBestDebt,
+    getMaxDebtToRepay,
+} = require("./healthFactor");
+
+const tracker = require("./positionTracker");
+
+//STATE
 
 let provider;
+let aavePool;
+let aaveOracle;
 let lastBlockTime = Date.now();
+
+//PROVIDER SETUP//
 
 function createProvider() {
     provider = new ethers.WebSocketProvider(process.env.RPC_WSS);
-    let aavePool = new ethers.Contract(AAVE_POOL_ADDRESS, AAVE_POOL_ABI, provider);
+    aavePool = new ethers.Contract(AAVE_POOL_ADDRESS, AAVE_POOL_ABI, provider);
+    aaveOracle = new ethers.Contract(AAVE_ORACLE_ADDRESS, AAVE_ORACLE_ABI, provider);
 
-    // Watchdog — if no block in 30s, reconnect
     const watchdog = setInterval(() => {
         if (Date.now() - lastBlockTime > 30_000) {
-            console.log("\n[watcher] No block in 30s — reconnecting...");
+            console.log("\n[watcher] Reconnecting...");
             clearInterval(watchdog);
             createProvider();
         }
     }, 5_000);
 
+    //One block listener
     provider.on("block", async (blockNumber) => {
         lastBlockTime = Date.now();
-        console.log(`Block ${blockNumber}`);
-        const TEST_ADDRESS = "0xd7b163B671f8cE9379DF8Ff7F75fA72Ccec1841c";
-
-        try {
-            const data = await aavePool.getUserAccountData(TEST_ADDRESS);
-            const hf = data.healthFactor;
-            // healthFactor is 1e18 scaled — divide to get human number
-            const hfReadable = (Number(hf) / 1e18).toFixed(4);
-            console.log(`[liq] ${TEST_ADDRESS.slice(0, 8)}... HF: ${hfReadable}`);
-        } catch (err) {
-            console.log("[liq] call failed:", err.message);
-        }
+        process.stdout.write(
+            `\r[watcher] Block ${blockNumber} | Positions: ${tracker.getSize()}`
+        );
+        await runLiquidationStrategy(blockNumber);
     });
+
+    aavePool.on("Borrow", (reserve, user, onBehalfOf) => {
+        tracker.addPosition(onBehalfOf);
+    });
+    aavePool.on("Supply", (reserve, user, onBehalfOf) => {
+        tracker.addPosition(onBehalfOf);
+    });
+
+    provider.on("error", (err) => {
+        console.error("\n[watcher] Error:", err.message);
+    });
+
+    console.log("[watcher] Connected");
+}
+
+// STRATEGY 1:LIQUIDATION
+async function runLiquidationStrategy(blockNumber) {
+    const tasks = [];
+    for (const [address] of tracker.getAll()) {
+        if (tracker.isPending(address)) continue;
+        tasks.push(checkPosition(address, blockNumber));
+    }
+    await runInBatches(tasks, 10);
+}
+
+async function checkPosition(address, blockNumber) {
+    try {
+        const raw = await aavePool.getUserAccountData(address);
+        const parsed = parseAccountData(raw);
+
+        console.log(`\n[HF] ${address.slice(0, 10)}... → ${formatHF(parsed.healthFactor)}`);
+
+        if (parsed.totalDebtUsd === 0n) {
+            tracker.removePosition(address);
+            return;
+        }
+
+        if (parsed.isLiquidatable) {
+            console.log(`[liq] LIQUIDATABLE: ${address} HF: ${formatHF(parsed.healthFactor)}`);
+            console.log("[liq] WOULD EMIT signal");
+        } else if (parsed.isDangerZone) {
+            console.log(`[liq] DANGER ZONE: ${address} HF: ${formatHF(parsed.healthFactor)}`);
+        }
+
+    } catch (err) {
+        console.log(`[liq] skip ${address.slice(0, 10)}:`, err.shortMessage || err.message);
+    }
+}
+
+async function runInBatches(promises, batchSize) {
+    for (let i = 0; i < promises.length; i += batchSize) {
+        await Promise.allSettled(promises.slice(i, i + batchSize));
+    }
 }
 
 createProvider();

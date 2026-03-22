@@ -59,8 +59,10 @@ const state = {
     bundlesFailed: 0,
     lastLiquidation: null,
     lastArbitrage: null,
+    lastBackrun: null,
     totalLiquidations: 0,
     totalArbitrages: 0,
+    totalBackruns: 0,
     isRunning: false,
     logs: [],
 };
@@ -114,10 +116,35 @@ function emitMockArbSignal() {
     log(`   Token In: ${mockSignal.tokenIn}`);
     log(`   Token Out: ${mockSignal.tokenOut}`);
     log(`   Amount: ${ethers.formatEther(mockSignal.amountIn)} WETH`);
-    log(`   Buy pool: ${mockSignal.buyFee / 100}% fee tier`);
-    log(`   Sell pool: ${mockSignal.sellFee / 100}% fee tier`);
+    log(`   Buy DEX:   ${mockSignal.buyOnUniswap ? "Uniswap V3" : "Sushiswap V2"}`);
+    log(`   Uni fee:   ${mockSignal.uniswapFee / 100}%`);
 
     signalBus.emit("arbitrage", mockSignal);
+}
+
+function emitMockBackrunSignal() {
+    const mockSignal = {
+        txHash: "0x" + "ab".repeat(32),
+        to: "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
+        value: ethers.parseEther("2.0").toString(),
+        valueEth: 2.0,
+        gasPrice: ethers.parseUnits("20", "gwei").toString(),
+        from: "0x" + "de".repeat(20),
+        data: "0x",
+        tokenIn: SEPOLIA_WETH,
+        tokenOut: SEPOLIA_USDC,
+        amountIn: ethers.parseEther("2.0").toString(),
+        buyOnUniswap: false,
+        uniswapFee: 3000,
+    };
+
+    log("MOCK MODE: Emitting test backrun signal...");
+    log(`   Target Tx: ${mockSignal.txHash.slice(0, 12)}...`);
+    log(`   Value:     ${mockSignal.valueEth} ETH`);
+    log(`   Token In:  ${mockSignal.tokenIn}`);
+    log(`   Token Out: ${mockSignal.tokenOut}`);
+
+    signalBus.emit("backrun", mockSignal);
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +176,20 @@ function encodeArbitrageTx(signal) {
         signal.buyOnUniswap,
         signal.uniswapFee,
         minProfit,
+    ]);
+}
+
+function encodeBackrunTx(signal) {
+    const minProfit = 0;
+
+    return iface.encodeFunctionData("executeBackrun", [
+        signal.tokenIn,
+        signal.tokenOut,
+        signal.amountIn,
+        signal.buyOnUniswap,
+        signal.uniswapFee,
+        minProfit,
+        signal.txHash, // bytes32 — identifies which tx we backran
     ]);
 }
 
@@ -224,6 +265,48 @@ async function buildAndSendBundle(
             },
         ];
 
+        if (process.env.DEMO_BYPASS_FLASHBOTS === "true") {
+            log(`\n 🚀 [RELAY] Sending bundle directly to local Anvil fork...`);
+            let lastHash = "0x" + "a1b2c3d4".repeat(8);
+            try {
+                const signedBundle = await flashbotsProvider.signBundle(bundleTransactions);
+                for (const signedTx of signedBundle) {
+                    const txResponse = await provider.sendTransaction(signedTx);
+                    const receipt = await txResponse.wait();
+                    log(`   Tx mined in block ${receipt.blockNumber} (Gas: ${receipt.gasUsed})`);
+                    lastHash = txResponse.hash;
+                }
+                log(` 💰 [SUCCESS] ${strategyName.toUpperCase()} genuinely executed ON-CHAIN!`);
+            } catch (err) {
+                log(`   ❌ Local execution failed: ${err.message}`);
+                return;
+            }
+
+            state.bundlesSent++;
+            state.bundlesLanded++;
+            if (strategyName === "liquidation") {
+                state.totalLiquidations++;
+                state.lastLiquidation = {
+                    timestamp: new Date().toISOString(),
+                    targetBlock,
+                    borrower: signal.borrower,
+                    profitETH: profitAnalysis.netProfitETH,
+                    bundleHash: lastHash,
+                };
+            } else if (strategyName === "arbitrage") {
+                state.totalArbitrages++;
+                state.lastArbitrage = {
+                    timestamp: new Date().toISOString(),
+                    targetBlock,
+                    tokenIn: signal.tokenIn,
+                    tokenOut: signal.tokenOut,
+                    profitETH: profitAnalysis.netProfitETH,
+                    bundleHash: lastHash,
+                };
+            }
+            return;
+        }
+
         const signedBundle = await flashbotsProvider.signBundle(bundleTransactions);
         const simulation = await simulateBundle(flashbotsProvider, signedBundle, targetBlock);
 
@@ -291,6 +374,139 @@ async function buildAndSendBundle(
 }
 
 // ---------------------------------------------------------------------------
+// Backrun-specific bundle builder — 2-tx bundle (target + our backrun)
+// ---------------------------------------------------------------------------
+
+async function buildAndSendBackrunBundle(
+    targetRawTx,
+    calldata,
+    profitAnalysis,
+    signal,
+    wallet,
+    provider,
+    flashbotsProvider
+) {
+    const block = await provider.getBlock("latest");
+    const baseFee = block.baseFeePerGas;
+    const priorityFee = ethers.parseUnits(PRIORITY_FEE_GWEI, "gwei");
+    const maxFeePerGas = baseFee * 2n + priorityFee;
+    const currentBlock = block.number;
+
+    state.currentBlock = currentBlock;
+
+    log(`  Building backrun bundle...`);
+    log(`   Target tx: ${signal.txHash.slice(0, 12)}...`);
+    log(`   Contract: ${CONTRACT_ADDRESS}`);
+    log(`   BaseFee: ${ethers.formatUnits(baseFee, "gwei")} gwei`);
+    log(`   MaxFeePerGas: ${ethers.formatUnits(maxFeePerGas, "gwei")} gwei`);
+
+    const targetBlocks = [currentBlock + 1, currentBlock + 2];
+
+    for (const targetBlock of targetBlocks) {
+        // Bundle ordering matters: target tx executes FIRST (creates price impact),
+        // our backrun tx executes SECOND (captures the profit from that impact).
+        const bundleTransactions = [
+            { signedTransaction: targetRawTx },
+            {
+                signer: wallet,
+                transaction: {
+                    to: CONTRACT_ADDRESS,
+                    data: calldata,
+                    gasLimit: GAS_LIMIT,
+                    maxFeePerGas: maxFeePerGas,
+                    maxPriorityFeePerGas: priorityFee,
+                    chainId: SEPOLIA_CHAIN_ID,
+                    type: 2,
+                },
+            },
+        ];
+
+        if (process.env.DEMO_BYPASS_FLASHBOTS === "true") {
+            log(`\n 🚀 [RELAY] Sending backrun bundle directly to local Anvil fork...`);
+            let lastHash = "0x" + "a1b2c3d4".repeat(8);
+            try {
+                const signedBundle = await flashbotsProvider.signBundle(bundleTransactions);
+                for (const signedTx of signedBundle) {
+                    const txResponse = await provider.sendTransaction(signedTx);
+                    const receipt = await txResponse.wait();
+                    log(`   Tx mined in block ${receipt.blockNumber} (Gas: ${receipt.gasUsed})`);
+                    lastHash = txResponse.hash;
+                }
+                log(` 💰 [SUCCESS] BACKRUN genuinely executed ON-CHAIN!`);
+            } catch (err) {
+                log(`   ❌ Local execution failed: ${err.message}`);
+                return;
+            }
+
+            state.bundlesSent++;
+            state.bundlesLanded++;
+            state.totalBackruns++;
+            state.lastBackrun = {
+                timestamp: new Date().toISOString(),
+                targetBlock,
+                targetTxHash: signal.txHash,
+                valueEth: signal.valueEth,
+                profitETH: profitAnalysis.netProfitETH,
+                bundleHash: lastHash,
+            };
+            return;
+        }
+
+        const signedBundle = await flashbotsProvider.signBundle(bundleTransactions);
+        const simulation = await simulateBundle(flashbotsProvider, signedBundle, targetBlock);
+
+        if (!simulation) {
+            log(`  Skipping block ${targetBlock} — simulation failed`);
+            state.bundlesFailed++;
+            continue;
+        }
+
+        log(` Sending backrun bundle for block ${targetBlock}...`);
+        const bundleResponse = await flashbotsProvider.sendRawBundle(signedBundle, targetBlock);
+
+        if ("error" in bundleResponse) {
+            log(` Bundle send error: ${bundleResponse.error.message}`);
+            state.bundlesFailed++;
+            continue;
+        }
+
+        state.bundlesSent++;
+        log(` Backrun bundle sent! Hash: ${bundleResponse.bundleHash}`);
+
+        const resolution = await bundleResponse.wait();
+
+        switch (resolution) {
+            case FlashbotsBundleResolution.BundleIncluded:
+                log(` BACKRUN BUNDLE INCLUDED in block ${targetBlock}!`);
+                state.bundlesLanded++;
+                state.totalBackruns++;
+                state.lastBackrun = {
+                    timestamp: new Date().toISOString(),
+                    targetBlock,
+                    targetTxHash: signal.txHash,
+                    valueEth: signal.valueEth,
+                    profitETH: profitAnalysis.netProfitETH,
+                    bundleHash: bundleResponse.bundleHash,
+                };
+                return;
+
+            case FlashbotsBundleResolution.BlockPassedWithoutInclusion:
+                log(` Block ${targetBlock} passed without inclusion, trying next...`);
+                break;
+
+            case FlashbotsBundleResolution.AccountNonceTooHigh:
+                log(` Nonce too high — another tx was mined. Aborting.`);
+                return;
+
+            default:
+                log(` Unknown resolution: ${resolution}`);
+        }
+    }
+
+    log(` Backrun bundle was NOT included in any target block.`);
+}
+
+// ---------------------------------------------------------------------------
 // Main pipelines — one per strategy
 // ---------------------------------------------------------------------------
 
@@ -333,8 +549,8 @@ async function handleArbSignal(signal, wallet, provider, flashbotsProvider) {
     log(`   Token In: ${signal.tokenIn}`);
     log(`   Token Out: ${signal.tokenOut}`);
     log(`   Amount: ${ethers.formatEther(signal.amountIn)} tokens`);
-    log(`   Buy pool: ${signal.buyFee / 100}% fee tier`);
-    log(`   Sell pool: ${signal.sellFee / 100}% fee tier`);
+    log(`   Buy DEX:   ${signal.buyOnUniswap ? "Uniswap V3" : "Sushiswap V2"}`);
+    log(`   Uni fee:   ${signal.uniswapFee / 100}%`);
     log(`${"=".repeat(60)}`);
 
     try {
@@ -363,6 +579,72 @@ async function handleArbSignal(signal, wallet, provider, flashbotsProvider) {
         await buildAndSendBundle(calldata, "arbitrage", profitAnalysis, signal, wallet, provider, flashbotsProvider);
     } catch (err) {
         log(`\n ERROR processing arbitrage: ${err.message}`);
+        console.error(err);
+    }
+}
+
+async function handleBackrunSignal(signal, wallet, provider, flashbotsProvider) {
+    log(`\n${"=".repeat(60)}`);
+    log(` BACKRUN SIGNAL RECEIVED`);
+    log(`   Target Tx:  ${signal.txHash.slice(0, 12)}...`);
+    log(`   Value:      ${signal.valueEth} ETH`);
+    log(`   Token In:   ${signal.tokenIn || "unknown"}`);
+    log(`   Token Out:  ${signal.tokenOut || "unknown"}`);
+    log(`   Amount In:  ${signal.amountIn || "unknown"}`);
+    log(`${"=".repeat(60)}`);
+
+    try {
+        // We need decoded swap info to build our counter-trade
+        if (!signal.tokenIn || !signal.tokenOut || !signal.amountIn) {
+            log(` Cannot decode swap details from target tx — skipping.`);
+            return;
+        }
+
+        // Fetch the raw signed transaction from the mempool.
+        // This is needed because the Flashbots bundle must include the
+        // exact signed bytes of the target tx as the first entry.
+        log(` Fetching raw transaction for ${signal.txHash.slice(0, 12)}...`);
+        let targetRawTx;
+        try {
+            targetRawTx = await provider.send("eth_getRawTransactionByHash", [signal.txHash]);
+        } catch (err) {
+            log(` Could not fetch raw tx: ${err.message}`);
+            log(`   (provider may not support eth_getRawTransactionByHash)`);
+            return;
+        }
+
+        if (!targetRawTx) {
+            log(` Target tx no longer in mempool — already mined or dropped. Skipping.`);
+            return;
+        }
+
+        // Profit estimation: the backrun captures a fraction of the
+        // price impact created by the target swap. We conservatively
+        // estimate ~1% of the swap value as recoverable profit.
+        log(` Calculating backrun profitability...`);
+        const estimatedProfitRaw = BigInt(signal.amountIn) / 100n;
+        const profitAnalysis = await calculateArbProfit(
+            { profitRaw: estimatedProfitRaw, amountIn: BigInt(signal.amountIn) },
+            provider
+        );
+
+        log(`   Estimated gross: ${profitAnalysis.grossProfitETH} ETH`);
+        log(`   Gas cost:        ${profitAnalysis.gasCostETH} ETH`);
+        log(`   Net profit:      ${profitAnalysis.netProfitETH} ETH`);
+
+        if (!profitAnalysis.isWorthIt) {
+            log(`\n NOT PROFITABLE — skipping this backrun.`);
+            return;
+        }
+
+        log(`\n PROFITABLE — proceeding to backrun bundle...`);
+        const calldata = encodeBackrunTx(signal);
+        await buildAndSendBackrunBundle(
+            targetRawTx, calldata, profitAnalysis, signal,
+            wallet, provider, flashbotsProvider
+        );
+    } catch (err) {
+        log(`\n ERROR processing backrun: ${err.message}`);
         console.error(err);
     }
 }
@@ -436,6 +718,10 @@ async function initBundler() {
         handleArbSignal(signal, ownerWallet, provider, flashbotsProvider);
     });
 
+    signalBus.on("backrun", (signal) => {
+        handleBackrunSignal(signal, ownerWallet, provider, flashbotsProvider);
+    });
+
     state.isRunning = true;
     log(`\n Bundler is LIVE — listening for signals from watcher...\n`);
 }
@@ -494,7 +780,7 @@ async function main() {
         log(`  WARNING: Owner has 0 ETH — transactions will fail!`);
     }
 
-    // Register signal handlers — Job 1 (both strategies)
+    // Register signal handlers — Job 1 (all strategies)
     signalBus.on("liquidation", (signal) => {
         handleLiquidationSignal(signal, ownerWallet, provider, flashbotsProvider);
     });
@@ -503,8 +789,12 @@ async function main() {
         handleArbSignal(signal, ownerWallet, provider, flashbotsProvider);
     });
 
+    signalBus.on("backrun", (signal) => {
+        handleBackrunSignal(signal, ownerWallet, provider, flashbotsProvider);
+    });
+
     state.isRunning = true;
-    log(`\n Bundler is LIVE — listening for liquidation + arbitrage signals...\n`);
+    log(`\n Bundler is LIVE — listening for liquidation + arbitrage + backrun signals...\n`);
 
     // Mock modes for testing
     if (process.env.MOCK_MODE === "true") {
@@ -512,6 +802,9 @@ async function main() {
     }
     if (process.env.MOCK_ARB === "true") {
         setTimeout(() => emitMockArbSignal(), 2000);
+    }
+    if (process.env.MOCK_BACKRUN === "true") {
+        setTimeout(() => emitMockBackrunSignal(), 2000);
     }
 
     // Keep the process alive — track new blocks
@@ -534,10 +827,13 @@ module.exports = {
     initBundler,
     handleLiquidationSignal,
     handleArbSignal,
+    handleBackrunSignal,
     encodeLiquidationTx,
     encodeArbitrageTx,
+    encodeBackrunTx,
     simulateBundle,
     buildAndSendBundle,
+    buildAndSendBackrunBundle,
 };
 
 // Run if called directly

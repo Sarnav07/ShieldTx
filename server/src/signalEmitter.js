@@ -6,7 +6,7 @@
  *
  * Events:
  *   "liquidation" → { borrower, debtAsset, collateralAsset, maxDebtToRepay, collateralAmount, healthFactor }
- *   "arbitrage"   → { type, tokenIn, tokenOut, amountIn, dexA, dexB, buyFee, sellFee, expectedProfitRaw }
+ *   "arbitrage"   → { type, tokenIn, tokenOut, amountIn, buyOnUniswap, uniswapFee, expectedProfitRaw }
  *
  * Both watchers.js and bundler.js import this same instance so signals
  * flow in-process without any network hop.

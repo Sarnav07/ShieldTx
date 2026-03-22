@@ -17,16 +17,34 @@ const fs = require("fs");
 // Configuration — Sepolia testnet
 // ---------------------------------------------------------------------------
 
-// Load addresses from shared config
-const NETWORKS_PATH = path.resolve(__dirname, "../../aave-flashbot-bot/config/networks.json");
-const NETWORKS = JSON.parse(fs.readFileSync(NETWORKS_PATH, "utf-8"));
+const IS_MAINNET = process.env.NETWORK === "mainnet";
 
-// Deployed AaveLiquidator contract on Sepolia
-const CONTRACT_ADDRESS = NETWORKS.sepolia.contractAddress;
+let CONTRACT_ADDRESS;
+if (IS_MAINNET) {
+  try {
+    const demoConfigPath = path.resolve(__dirname, "../../.demo-contract.json");
+    const demoConfig = JSON.parse(fs.readFileSync(demoConfigPath, "utf-8"));
+    CONTRACT_ADDRESS = demoConfig.contractAddress;
+  } catch (e) {
+    console.warn("⚠️  [WARN] No .demo-contract.json found. Run inject-chaos.js first!");
+    CONTRACT_ADDRESS = "0x0000000000000000000000000000000000000000";
+  }
+} else {
+  const NETWORKS_PATH = path.resolve(__dirname, "../../aave-flashbot-bot/config/networks.json");
+  const NETWORKS = JSON.parse(fs.readFileSync(NETWORKS_PATH, "utf-8"));
+  CONTRACT_ADDRESS = NETWORKS.sepolia.contractAddress;
+}
 
-// Sepolia token addresses
-const SEPOLIA_WETH = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
-const SEPOLIA_USDC = "0x94a9d9ac8a22534e3faca9f4e7f2e2cf85d5e4c8";
+
+
+// Token addresses
+const WETH_ADDR = IS_MAINNET
+  ? "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+  : "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
+
+const USDC_ADDR = IS_MAINNET
+  ? "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+  : "0x94a9d9ac8a22534e3faca9f4e7f2e2cf85d5e4c8";
 
 const CONFIG = {
   // Aave V3 liquidation bonus — 5% on most assets (1.05 multiplier)
@@ -44,16 +62,15 @@ const CONFIG = {
   // Minimum profit in ETH below which we skip the liquidation
   MIN_PROFIT_THRESHOLD_ETH: 0.001,
 
-  // Chainlink price feed addresses — Sepolia testnet
-  // NOTE: Only ETH/USD has an official Chainlink feed on Sepolia.
-  //       Stablecoins (USDC, USDT, DAI) default to $1.00 — see getTokenPriceUSD().
+  // Chainlink price feed addresses
+  // NOTE: On an Anvil fork or testnet, we assume stablecoins = $1.00
   PRICE_FEEDS: {
-    // ETH/USD on Sepolia
-    [SEPOLIA_WETH]: "0x694AA1769357215DE4FAC081bf1f309aDC325306",
+    // ETH/USD (Sepolia and Mainnet use different feeds, but for the demo we'll use a fast mock)
+    [WETH_ADDR]: IS_MAINNET ? "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419" : "0x694AA1769357215DE4FAC081bf1f309aDC325306",
   },
 
-  // Stablecoins that we assume = $1.00 (no Chainlink feed on Sepolia)
-  STABLECOINS: new Set([SEPOLIA_USDC]),
+  // Stablecoins that we assume = $1.00
+  STABLECOINS: new Set([USDC_ADDR]),
 };
 
 // Minimal Chainlink aggregator ABI — just what we need
@@ -136,7 +153,7 @@ async function calculateProfit(signal, provider) {
   const [collateralPriceUSD, debtPriceUSD, ethPriceUSD] = await Promise.all([
     getTokenPriceUSD(collateralAsset, provider),
     getTokenPriceUSD(debtAsset, provider),
-    getTokenPriceUSD(SEPOLIA_WETH, provider),
+    getTokenPriceUSD(WETH_ADDR, provider),
   ]);
 
   // 2. Determine token decimal scaling
@@ -213,8 +230,8 @@ async function calculateProfit(signal, provider) {
  * For a hackathon, hardcoding is fine. Production would query the contract.
  */
 const TOKEN_DECIMALS = {
-  [SEPOLIA_USDC]: 6,   // USDC on Sepolia
-  [SEPOLIA_WETH]: 18,  // WETH on Sepolia
+  [USDC_ADDR]: 6,
+  [WETH_ADDR]: 18,
 };
 
 function getTokenDecimals(tokenAddress) {
@@ -242,6 +259,6 @@ module.exports = {
   getBaseFee,
   CONFIG,
   CONTRACT_ADDRESS,
-  SEPOLIA_WETH,
-  SEPOLIA_USDC,
+  WETH_ADDR,
+  USDC_ADDR,
 };

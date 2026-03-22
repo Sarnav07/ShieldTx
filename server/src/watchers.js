@@ -57,15 +57,17 @@ let stats = {
 
 const WATCH_PAIRS = [
     {
-        tokenIn: process.env.MAINNET_WETH,
-        tokenOut: process.env.MAINNET_USDC,
+        tokenIn: TOKENS.WETH.address,
+        tokenOut: TOKENS.USDC.address,
         label: "WETH/USDC",
     },
 ];
 
-const BACKRUN_MIN_SWAP_ETH = ethers.parseEther("1.0");
+const BACKRUN_MIN_SWAP_ETH = ethers.parseEther("0.1"); // lower threshold for Sepolia
 const KNOWN_ROUTERS = new Set([
-    "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45".toLowerCase(),
+    // Uniswap V3 SwapRouter02 on Sepolia
+    "0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E".toLowerCase(),
+    // Uniswap Universal Router on Sepolia
     "0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD".toLowerCase(),
 ]);
 const backrunSeen = new Set();
@@ -251,8 +253,9 @@ async function scanArbPair(pair, blockNumber) {
 
         console.log(
             `\n[arb] ${pair.label} | Block ${blockNumber}` +
-            `\n      Buy fee:  ${opportunity.buyFee / 10000}%` +
-            `\n      Sell fee: ${opportunity.sellFee / 10000}%` +
+            `\n      Buy DEX:  ${opportunity.buyOnUniswap ? "Uniswap V3" : "Sushiswap V2"}` +
+            `\n      Sell DEX: ${opportunity.buyOnUniswap ? "Sushiswap V2" : "Uniswap V3"}` +
+            `\n      Uni fee:  ${opportunity.uniswapFee / 100}%` +
             `\n      Gross:    ${profitAnalysis.grossProfitETH} ETH` +
             `\n      Gas cost: ${profitAnalysis.gasCostETH} ETH` +
             `\n      Net:      ${profitAnalysis.netProfitETH} ETH` +

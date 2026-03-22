@@ -13,11 +13,20 @@
  */
 
 const { ethers } = require("ethers");
-const { getBaseFee, SEPOLIA_WETH, SEPOLIA_USDC } = require("./profitCalculator");
+const { getBaseFee, WETH_ADDR, USDC_ADDR } = require("./profitCalculator");
 
 // ---------------------------------------------------------------------------
 // Sepolia DEX Addresses
 // ---------------------------------------------------------------------------
+
+const IS_MAINNET = process.env.NETWORK === "mainnet";
+
+const MAINNET_ADDRESSES = {
+    SWAP_ROUTER_02: "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
+    UNIVERSAL_ROUTER: "0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD",
+    QUOTER_V2: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
+    FACTORY: "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+};
 
 const SEPOLIA_ADDRESSES = {
     // Uniswap V3 Routers — our contract can use either as dexA / dexB
@@ -30,6 +39,16 @@ const SEPOLIA_ADDRESSES = {
     // Uniswap V3 Factory — used to check if pools exist
     FACTORY: "0x0227628f3F023bb0B980b67D528571c95c6DaC1c",
 };
+
+const ACTIVE = IS_MAINNET ? MAINNET_ADDRESSES : SEPOLIA_ADDRESSES;
+
+// Sushiswap V2 Router — must match the address hardcoded in AaveLiquidator.sol
+// The contract uses this for the V2 leg of cross-DEX arbs.
+const SUSHI_ROUTER_V2 = "0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F";
+
+const SUSHI_ROUTER_ABI = [
+    "function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)",
+];
 
 // Uniswap V3 fee tiers in basis points
 const FEE_TIERS = {
@@ -89,7 +108,7 @@ const ARB_CONFIG = {
  */
 async function getQuote(provider, tokenIn, tokenOut, amountIn, feeTier) {
     const quoter = new ethers.Contract(
-        SEPOLIA_ADDRESSES.QUOTER_V2,
+        ACTIVE.QUOTER_V2,
         QUOTER_ABI,
         provider
     );
@@ -124,7 +143,7 @@ async function getQuote(provider, tokenIn, tokenOut, amountIn, feeTier) {
  */
 async function poolExists(provider, tokenA, tokenB, feeTier) {
     const factory = new ethers.Contract(
-        SEPOLIA_ADDRESSES.FACTORY,
+        ACTIVE.FACTORY,
         FACTORY_ABI,
         provider
     );
@@ -134,14 +153,41 @@ async function poolExists(provider, tokenA, tokenB, feeTier) {
 }
 
 /**
- * Scans all fee tier combinations for arbitrage opportunities.
+ * Queries Sushiswap V2 router for the output of a swap.
+ * Uses getAmountsOut (view function, no gas cost).
  *
- * Strategy: Buy tokenOut on the cheaper pool (lower output = higher price),
- * sell on the more expensive pool (higher output = lower price).
- * Actually: if Pool A gives more tokenOut per tokenIn than Pool B,
- * we buy on Pool A and sell back on Pool B — but since we're doing
- * a round trip (tokenIn → tokenOut → tokenIn), we check if we end
- * up with more tokenIn than we started.
+ * @param {ethers.Provider} provider
+ * @param {string} tokenIn
+ * @param {string} tokenOut
+ * @param {bigint} amountIn
+ * @returns {Promise<{amountOut: bigint} | null>}
+ */
+async function getSushiQuote(provider, tokenIn, tokenOut, amountIn) {
+    const sushiRouter = new ethers.Contract(
+        SUSHI_ROUTER_V2,
+        SUSHI_ROUTER_ABI,
+        provider
+    );
+
+    try {
+        const amounts = await sushiRouter.getAmountsOut(amountIn, [tokenIn, tokenOut]);
+        return { amountOut: amounts[1] };
+    } catch {
+        // Pair doesn't exist or no liquidity
+        return null;
+    }
+}
+
+/**
+ * Scans for cross-DEX arbitrage opportunities between Uniswap V3 and Sushiswap V2.
+ *
+ * This matches the AaveLiquidator contract exactly:
+ *   Route A (buyOnUniswap = true):  Buy on Uni V3 → Sell on Sushi V2
+ *   Route B (buyOnUniswap = false): Buy on Sushi V2 → Sell on Uni V3
+ *
+ * For Route A, we try every Uni V3 fee tier as the buy leg.
+ * For Route B, we try every Uni V3 fee tier as the sell leg.
+ * The most profitable combination across all routes and probe amounts wins.
  *
  * @param {ethers.Provider} provider
  * @param {string} tokenIn - e.g., WETH
@@ -150,55 +196,29 @@ async function poolExists(provider, tokenA, tokenB, feeTier) {
  */
 async function findArbOpportunity(provider, tokenIn, tokenOut) {
     const feeTiers = Object.values(FEE_TIERS);
-
-    // Step 1: Get quotes for every fee tier
-    const quotes = {};
-    const quotePromises = feeTiers.map(async (fee) => {
-        // Use the smallest probe amount for price discovery
-        const quote = await getQuote(
-            provider,
-            tokenIn,
-            tokenOut,
-            ARB_CONFIG.PROBE_AMOUNTS_WETH[0],
-            fee
-        );
-        if (quote) {
-            quotes[fee] = quote;
-        }
-    });
-
-    await Promise.all(quotePromises);
-
-    const activeTiers = Object.keys(quotes).map(Number);
-    if (activeTiers.length < 2) {
-        return null; // Need at least 2 pools to arb between
-    }
-
-    // Step 2: For each pair of fee tiers, check the round-trip profit
     let bestOpportunity = null;
 
-    for (let i = 0; i < activeTiers.length; i++) {
-        for (let j = 0; j < activeTiers.length; j++) {
-            if (i === j) continue;
+    for (const amountIn of ARB_CONFIG.PROBE_AMOUNTS_WETH) {
+        // ── Route A: Buy on Uniswap V3, Sell on Sushiswap V2 ──────────
+        for (const fee of feeTiers) {
+            const opp = await checkCrossDexRoundTrip(
+                provider, tokenIn, tokenOut, amountIn, fee, true
+            );
+            if (opp && opp.profitRaw > 0n) {
+                if (!bestOpportunity || opp.profitRaw > bestOpportunity.profitRaw) {
+                    bestOpportunity = opp;
+                }
+            }
+        }
 
-            const buyFee = activeTiers[i];
-            const sellFee = activeTiers[j];
-
-            // Try each probe amount to find the best one
-            for (const amountIn of ARB_CONFIG.PROBE_AMOUNTS_WETH) {
-                const opportunity = await checkRoundTrip(
-                    provider,
-                    tokenIn,
-                    tokenOut,
-                    amountIn,
-                    buyFee,
-                    sellFee
-                );
-
-                if (opportunity && opportunity.profitRaw > 0n) {
-                    if (!bestOpportunity || opportunity.profitRaw > bestOpportunity.profitRaw) {
-                        bestOpportunity = opportunity;
-                    }
+        // ── Route B: Buy on Sushiswap V2, Sell on Uniswap V3 ──────────
+        for (const fee of feeTiers) {
+            const opp = await checkCrossDexRoundTrip(
+                provider, tokenIn, tokenOut, amountIn, fee, false
+            );
+            if (opp && opp.profitRaw > 0n) {
+                if (!bestOpportunity || opp.profitRaw > bestOpportunity.profitRaw) {
+                    bestOpportunity = opp;
                 }
             }
         }
@@ -208,50 +228,59 @@ async function findArbOpportunity(provider, tokenIn, tokenOut) {
 }
 
 /**
- * Checks the round-trip profitability:
- *   tokenIn --[buyFee]--> tokenOut --[sellFee]--> tokenIn
+ * Checks the cross-DEX round-trip profitability.
  *
- * If we get back more tokenIn than we started, it's a profitable arb.
+ * If buyOnUniswap = true:
+ *   Leg 1: tokenIn →[Uni V3, uniswapFee]→ tokenOut
+ *   Leg 2: tokenOut →[Sushi V2]→ tokenIn
+ *
+ * If buyOnUniswap = false:
+ *   Leg 1: tokenIn →[Sushi V2]→ tokenOut
+ *   Leg 2: tokenOut →[Uni V3, uniswapFee]→ tokenIn
  *
  * @returns {Promise<object|null>}
  */
-async function checkRoundTrip(
-    provider,
-    tokenIn,
-    tokenOut,
-    amountIn,
-    buyFee,
-    sellFee
+async function checkCrossDexRoundTrip(
+    provider, tokenIn, tokenOut, amountIn, uniswapFee, buyOnUniswap
 ) {
-    // Leg 1: tokenIn → tokenOut on buyFee pool
-    const leg1 = await getQuote(provider, tokenIn, tokenOut, amountIn, buyFee);
-    if (!leg1) return null;
+    let leg1Out, leg2Out;
 
-    // Leg 2: tokenOut → tokenIn on sellFee pool
-    const leg2 = await getQuote(provider, tokenOut, tokenIn, leg1.amountOut, sellFee);
-    if (!leg2) return null;
+    if (buyOnUniswap) {
+        // Leg 1: Buy tokenOut on Uniswap V3
+        const leg1 = await getQuote(provider, tokenIn, tokenOut, amountIn, uniswapFee);
+        if (!leg1) return null;
+        leg1Out = leg1.amountOut;
 
-    const amountBack = leg2.amountOut;
-    const profitRaw = amountBack - amountIn; // in tokenIn's smallest unit
+        // Leg 2: Sell tokenOut for tokenIn on Sushiswap V2
+        const leg2 = await getSushiQuote(provider, tokenOut, tokenIn, leg1Out);
+        if (!leg2) return null;
+        leg2Out = leg2.amountOut;
+    } else {
+        // Leg 1: Buy tokenOut on Sushiswap V2
+        const leg1 = await getSushiQuote(provider, tokenIn, tokenOut, amountIn);
+        if (!leg1) return null;
+        leg1Out = leg1.amountOut;
 
+        // Leg 2: Sell tokenOut for tokenIn on Uniswap V3
+        const leg2 = await getQuote(provider, tokenOut, tokenIn, leg1Out, uniswapFee);
+        if (!leg2) return null;
+        leg2Out = leg2.amountOut;
+    }
+
+    const profitRaw = leg2Out - amountIn;
     if (profitRaw <= 0n) return null;
 
     return {
         tokenIn,
         tokenOut,
         amountIn,
-        amountBack,
+        amountBack: leg2Out,
         profitRaw,
-        buyFee,
-        sellFee,
-        leg1AmountOut: leg1.amountOut,
-        // For the contract: dexA = router to buy on, dexB = router to sell on
-        // Since both are Uniswap V3 pools (just different fee tiers),
-        // we use the same router — the contract's _swapOnDex hardcodes fee=3000,
-        // so for proper cross-fee-tier arb, the contract would need updating.
-        // For hackathon: we use SwapRouter02 for both legs.
-        dexA: SEPOLIA_ADDRESSES.SWAP_ROUTER_02,
-        dexB: SEPOLIA_ADDRESSES.SWAP_ROUTER_02,
+        buyOnUniswap,      // maps directly to contract's buyOnUniswap param
+        uniswapFee,        // maps directly to contract's uniswapFee param
+        leg1AmountOut: leg1Out,
+        dexA: buyOnUniswap ? ACTIVE.SWAP_ROUTER_02 : SUSHI_ROUTER_V2,
+        dexB: buyOnUniswap ? SUSHI_ROUTER_V2 : ACTIVE.SWAP_ROUTER_02,
     };
 }
 
@@ -289,9 +318,7 @@ async function calculateArbProfit(opportunity, provider) {
         gasCostETH: round(gasCostETH),
         recommendedTipETH: round(recommendedTipETH),
         keeperProfitETH: round(keeperProfitETH),
-        buyFee: opportunity.buyFee,
-        sellFee: opportunity.sellFee,
-        amountIn: opportunity.amountIn.toString(),
+        amountIn: opportunity.amountIn?.toString(),
     };
 }
 
@@ -307,8 +334,8 @@ function toArbSignal(opportunity) {
         tokenIn: opportunity.tokenIn,
         tokenOut: opportunity.tokenOut,
         amountIn: opportunity.amountIn.toString(),
-        buyOnUniswap: true, // Assuming the buy leg is on Uniswap for this placeholder logic
-        uniswapFee: opportunity.buyFee,
+        buyOnUniswap: opportunity.buyOnUniswap,
+        uniswapFee: opportunity.uniswapFee,
         expectedProfitRaw: opportunity.profitRaw.toString(),
     };
 }
@@ -326,8 +353,10 @@ module.exports = {
     calculateArbProfit,
     toArbSignal,
     getQuote,
+    getSushiQuote,
     poolExists,
-    SEPOLIA_ADDRESSES,
+    ACTIVE_ADDRESSES: ACTIVE,
+    SUSHI_ROUTER_V2,
     FEE_TIERS,
     ARB_CONFIG,
 };

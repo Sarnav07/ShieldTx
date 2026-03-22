@@ -223,7 +223,7 @@
 
         .strategies-row {
             display: grid;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
             gap: 16px;
             margin-bottom: 24px;
         }
@@ -267,6 +267,11 @@
         .strategy-count.purple {
             background: var(--accent-purple-glow);
             color: var(--accent-purple);
+        }
+
+        .strategy-count.amber {
+            background: var(--accent-amber-glow);
+            color: var(--accent-amber);
         }
 
         .detail-row {
@@ -514,6 +519,10 @@
                 <div class="stat-label">Arbitrages</div>
                 <div class="stat-value purple" id="totalArbitrages">0</div>
             </div>
+            <div class="stat-card">
+                <div class="stat-label">Backruns</div>
+                <div class="stat-value amber" id="totalBackruns">0</div>
+            </div>
         </div>
 
         <div class="strategies-row">
@@ -536,6 +545,16 @@
                     <div class="no-data">No arbitrages yet</div>
                 </div>
             </div>
+
+            <div class="strategy-card">
+                <div class="strategy-header">
+                    <div class="strategy-title">Last Backrun</div>
+                    <span class="strategy-count amber" id="backrunCount">0</span>
+                </div>
+                <div id="lastBackrun">
+                    <div class="no-data">No backruns yet</div>
+                </div>
+            </div>
         </div>
 
         <div class="log-section">
@@ -555,7 +574,7 @@
     <script>
         const API_URL = "/api/status";
         const POLL_INTERVAL = 2000;
-        
+
         document.getElementById("contractAddr").textContent = "Loading...";
 
         function formatUptime(seconds) {
@@ -593,6 +612,9 @@
 
             if (type === "liquidation") {
                 rows.push(detailRow("Borrower", shortenAddr(data.borrower)));
+            } else if (type === "backrun") {
+                rows.push(detailRow("Target Tx", shortenHash(data.targetTxHash)));
+                rows.push(detailRow("Swap Value", (data.valueEth || 0).toFixed(4) + " ETH"));
             } else {
                 rows.push(detailRow("Token In", shortenAddr(data.tokenIn)));
                 rows.push(detailRow("Token Out", shortenAddr(data.tokenOut)));
@@ -630,7 +652,7 @@
                     badge.className = "status-badge offline";
                     badge.innerHTML = '<span class="pulse"></span> OFFLINE';
                 }
-                
+
                 if (data.contractAddress) {
                     document.getElementById("contractAddr").textContent =
                         data.contractAddress.slice(0, 6) + "..." + data.contractAddress.slice(-4);
@@ -652,6 +674,11 @@
                 document.getElementById("arbCount").textContent = data.totalArbitrages || 0;
                 document.getElementById("lastArbitrage").innerHTML =
                     renderDetails(data.lastArbitrage, "arbitrage");
+
+                document.getElementById("totalBackruns").textContent = data.totalBackruns || 0;
+                document.getElementById("backrunCount").textContent = data.totalBackruns || 0;
+                document.getElementById("lastBackrun").innerHTML =
+                    renderDetails(data.lastBackrun, "backrun");
 
                 var logFeed = document.getElementById("logFeed");
                 if (data.logs && data.logs.length > 0) {

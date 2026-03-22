@@ -1,7 +1,3 @@
-# ShieldTx — MEV Liquidation Bot (Aave V3 + Flashbots)
-
-## Architecture
-```
 aave-flashbot-bot/
   src/               ← Solidity contracts (Foundry)
   test/              ← Solidity tests

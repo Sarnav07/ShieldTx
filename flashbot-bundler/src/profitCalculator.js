@@ -10,13 +10,19 @@
  */
 
 const { ethers } = require("ethers");
+const path = require("path");
+const fs = require("fs");
 
 // ---------------------------------------------------------------------------
 // Configuration — Sepolia testnet
 // ---------------------------------------------------------------------------
 
+// Load addresses from shared config
+const NETWORKS_PATH = path.resolve(__dirname, "../../aave-flashbot-bot/config/networks.json");
+const NETWORKS = JSON.parse(fs.readFileSync(NETWORKS_PATH, "utf-8"));
+
 // Deployed AaveLiquidator contract on Sepolia
-const CONTRACT_ADDRESS = "0x847335923C5D3d70791349E3b5d3Ed65739758c2";
+const CONTRACT_ADDRESS = NETWORKS.sepolia.contractAddress;
 
 // Sepolia token addresses
 const SEPOLIA_WETH = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";

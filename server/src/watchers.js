@@ -194,19 +194,19 @@ async function handleLiquidatable(address, parsed, blockNumber) {
 
         // full actionable payload C needs to build the bundle
         const signal = {
-            user: address,
+            borrower: address,
             debtAsset: bestDebt.asset,
             collateralAsset: bestCollateral,
-            debtAmount: debtAmount,        // BigInt — C uses this directly
+            maxDebtToRepay: debtAmount,        // BigInt — C uses this directly
             healthFactor: parsed.healthFactor,
             blockNumber,
         };
 
         console.log(`[liq] Signal #${stats.liqSignals} emitted`);
-        console.log(`      user:       ${signal.user.slice(0, 10)}...`);
+        console.log(`      borrower:   ${signal.borrower.slice(0, 10)}...`);
         console.log(`      debtAsset:  ${signal.debtAsset}`);
         console.log(`      collateral: ${signal.collateralAsset}`);
-        console.log(`      debtAmount: ${signal.debtAmount.toString()}`);
+        console.log(`      debtAmount: ${signal.maxDebtToRepay.toString()}`);
 
 
         signalEmitter.emit("liquidation", signal);
@@ -328,6 +328,8 @@ function startBackrunWatcher() {
                 tokenIn: decoded?.tokenIn || null,
                 tokenOut: decoded?.tokenOut || null,
                 amountIn: decoded?.amountIn || null,
+                buyOnUniswap: false,   // sell on Uni to counter the target's buy
+                uniswapFee: 3000,
             };
 
             console.log(`\n[backrun] Signal #${stats.backrunSignals} emitted`);

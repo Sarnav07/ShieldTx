@@ -25,7 +25,7 @@ const {
     FlashbotsBundleProvider,
     FlashbotsBundleResolution,
 } = require("@flashbots/ethers-provider-bundle");
-const { EventEmitter } = require("events");
+const signalEmitter = require("../../server/src/signalEmitter");
 const path = require("path");
 const fs = require("fs");
 
@@ -77,7 +77,8 @@ function log(msg) {
 // Job 1 — Listen for signals
 // ---------------------------------------------------------------------------
 
-const signalBus = new EventEmitter();
+// Use the shared signal emitter from the server
+const signalBus = signalEmitter;
 
 function emitMockLiquidationSignal() {
     const mockSignal = {
@@ -374,8 +375,81 @@ async function handleArbSignal(signal, wallet, provider, flashbotsProvider) {
 // Startup
 // ---------------------------------------------------------------------------
 
+/**
+ * initBundler() — sets up provider, wallet, Flashbots relay, and
+ * registers signal listeners on the shared emitter.
+ * Called by the unified entry point (server/index.js).
+ * Does NOT start its own block listener (the server's watcher handles that).
+ */
+async function initBundler() {
+    log(" MEV Bundler initialising (integrated mode)...");
+    log(`   Strategies: Liquidation + DEX Arbitrage`);
+    log(`   Network: Sepolia (chain ${SEPOLIA_CHAIN_ID})`);
+    log(`   Contract: ${CONTRACT_ADDRESS}`);
+    log(`   Relay: ${FLASHBOTS_RELAY_SEPOLIA}`);
+
+    // Validate env vars
+    const requiredEnvVars = ["SEPOLIA_RPC_URL", "PRIVATE_KEY", "FLASHBOTS_AUTH_KEY"];
+    for (const envVar of requiredEnvVars) {
+        if (!process.env[envVar]) {
+            log(`Missing env var: ${envVar}. Check your .env file.`);
+            process.exit(1);
+        }
+    }
+
+    // Connect to Sepolia
+    const provider = new ethers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
+    const network = await provider.getNetwork();
+    log(`   Connected to chainId: ${network.chainId}`);
+
+    if (Number(network.chainId) !== SEPOLIA_CHAIN_ID) {
+        log(`Wrong network! Expected Sepolia (${SEPOLIA_CHAIN_ID}), got ${network.chainId}`);
+        process.exit(1);
+    }
+
+    // Wallet setup
+    const ownerWallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+    log(`   Owner wallet: ${ownerWallet.address}`);
+
+    const relaySigningWallet = new ethers.Wallet(process.env.FLASHBOTS_AUTH_KEY);
+    log(`   Relay signer: ${relaySigningWallet.address}`);
+
+    // Connect to Flashbots relay
+    const flashbotsProvider = await FlashbotsBundleProvider.create(
+        provider,
+        relaySigningWallet,
+        FLASHBOTS_RELAY_SEPOLIA,
+        "sepolia"
+    );
+    log(`   Connected to Flashbots relay`);
+
+    // Check owner balance
+    const balance = await provider.getBalance(ownerWallet.address);
+    log(`   Owner balance: ${ethers.formatEther(balance)} ETH`);
+
+    if (balance === 0n) {
+        log(`  WARNING: Owner has 0 ETH — transactions will fail!`);
+    }
+
+    // Register signal handlers on the shared emitter
+    signalBus.on("liquidation", (signal) => {
+        handleLiquidationSignal(signal, ownerWallet, provider, flashbotsProvider);
+    });
+
+    signalBus.on("arbitrage", (signal) => {
+        handleArbSignal(signal, ownerWallet, provider, flashbotsProvider);
+    });
+
+    state.isRunning = true;
+    log(`\n Bundler is LIVE — listening for signals from watcher...\n`);
+}
+
+/**
+ * main() — standalone mode. Boots the bundler with its own block listener
+ * and optional mock signals. Used when running `node src/bundler.js` directly.
+ */
 async function main() {
-    log(" MEV Bundler starting...");
+    log(" MEV Bundler starting (standalone mode)...");
     log(`   Strategies: Liquidation + DEX Arbitrage`);
     log(`   Network: Sepolia (chain ${SEPOLIA_CHAIN_ID})`);
     log(`   Contract: ${CONTRACT_ADDRESS}`);
@@ -461,6 +535,7 @@ module.exports = {
     signalBus,
     state,
     main,
+    initBundler,
     handleLiquidationSignal,
     handleArbSignal,
     encodeLiquidationTx,

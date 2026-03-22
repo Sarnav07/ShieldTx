@@ -1,4 +1,5 @@
 require("dotenv").config();
+const signalEmitter = require("./signalEmitter");
 const { ethers } = require("ethers");
 const {
     AAVE_ORACLE_ADDRESS,
@@ -122,7 +123,37 @@ async function checkPosition(address, blockNumber) {
 
         if (parsed.isLiquidatable) {
             console.log(`[liq] LIQUIDATABLE: ${address} HF: ${formatHF(parsed.healthFactor)}`);
-            console.log("[liq] WOULD EMIT signal");   // replaced in Part 5
+
+            // Build full signal by querying user reserves for best debt/collateral
+            const tokenList = Object.values(TOKENS);
+            const reservePromises = tokenList.map(async (token) => {
+                try {
+                    const data = await aavePool.getUserReserveData(token.address, address);
+                    const price = await aaveOracle.getAssetPrice(token.address);
+                    return { ...data, asset: token.address, priceUsd: price };
+                } catch {
+                    return null;
+                }
+            });
+            const reserves = (await Promise.all(reservePromises)).filter(Boolean);
+
+            const bestDebt = pickBestDebt(reserves);
+            const bestCollateral = pickBestCollateral(reserves);
+
+            if (bestDebt && bestCollateral) {
+                const maxRepay = getMaxDebtToRepay(parsed.totalDebtUsd);
+                const signal = {
+                    borrower: address,
+                    debtAsset: bestDebt.asset,
+                    collateralAsset: bestCollateral,
+                    maxDebtToRepay: bestDebt.totalDebt.toString(),
+                    collateralAmount: maxRepay.toString(),
+                    healthFactor: formatHF(parsed.healthFactor),
+                };
+                console.log(`[liq] EMITTING liquidation signal for ${address.slice(0, 10)}...`);
+                signalEmitter.emit("liquidation", signal);
+                stats.liqSignals++;
+            }
         } else if (parsed.isDangerZone) {
             console.log(`[liq] DANGER ZONE: ${address} HF: ${formatHF(parsed.healthFactor)}`);
         }
@@ -185,7 +216,7 @@ async function scanArbPair(pair, blockNumber) {
             return;
         }
 
-        // Step 5: profitable — build signal and log it
+        // Step 5: profitable — build signal and emit it
         stats.arbSignals++;
 
         const signal = {
@@ -201,8 +232,8 @@ async function scanArbPair(pair, blockNumber) {
             `\n      You keep:       ${profitAnalysis.keeperProfitETH} ETH`
         );
 
-        // replaced with emitter.emit() in Part 5
-        console.log("[arb] WOULD EMIT ARB_SIGNAL", JSON.stringify(signal, null, 2));
+        console.log(`[arb] EMITTING arbitrage signal for ${pair.label}`);
+        signalEmitter.emit("arbitrage", signal);
 
     } catch (err) {
         console.error(`\n[arb] Error scanning ${pair.label}:`, err.message);

@@ -28,7 +28,8 @@ const {
     ARB_CONFIG,
 } = require("../../flashbot-bundler/src/arbCalculator");
 
-// State 
+// STATE
+// 
 let provider;
 let aavePool;
 let aaveOracle;
@@ -41,10 +42,14 @@ let stats = {
     arbScans: 0,
     arbSignals: 0,
     backrunSignals: 0,
-    protectionSignals: 0
+    protectionSignals: 0,
 };
 
-//Arb config 
+// 
+// CONFIG
+// 
+
+// Arb
 const WATCH_PAIRS = [
     {
         tokenIn: process.env.MAINNET_WETH,
@@ -53,30 +58,33 @@ const WATCH_PAIRS = [
     },
 ];
 
-//Backrun config 
-const BACKRUN_MIN_SWAP_ETH = ethers.parseEther("1.0"); // 1 ETH min on mainnet
+// Backrun
+const BACKRUN_MIN_SWAP_ETH = ethers.parseEther("1.0");
 const KNOWN_ROUTERS = new Set([
-    "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45".toLowerCase(), // SwapRouter02 mainnet
-    "0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD".toLowerCase(), // UniversalRouter mainnet
+    "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45".toLowerCase(),
+    "0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD".toLowerCase(),
 ]);
 const backrunSeen = new Set();
 
-//Protection config
-
+// Protection
 const HF_PROTECTION_THRESHOLD = ethers.parseUnits("1.1", 18);
 const protectedUsers = new Set([]);
 const protectionPending = new Set();
 
-
-
+// 
 // PROVIDER SETUP
-
+// 
 function createProvider() {
     provider = new ethers.WebSocketProvider(process.env.RPC_WSS);
     aavePool = new ethers.Contract(AAVE_POOL_ADDRESS, AAVE_POOL_ABI, provider);
     aaveOracle = new ethers.Contract(AAVE_ORACLE_ADDRESS, AAVE_ORACLE_ABI, provider);
 
-    //will reconnect if no block in 30s
+    // confirm which network we are on
+    provider.getNetwork().then(n =>
+        console.log("\n[watcher] Network:", n.name, "chainId:", n.chainId)
+    );
+
+    // reconnect if no block in 30s
     const watchdog = setInterval(() => {
         if (Date.now() - lastBlockTime > 30_000) {
             console.log("\n[watcher] No block in 30s — reconnecting...");
@@ -85,7 +93,7 @@ function createProvider() {
         }
     }, 5_000);
 
-    // Block listener — liquidation + arb in parallel
+
     provider.on("block", async (blockNumber) => {
         lastBlockTime = Date.now();
         process.stdout.write(
@@ -103,7 +111,7 @@ function createProvider() {
         ]);
     });
 
-    // Auto-discover new borrowers
+    // auto-discover new borrowers
     aavePool.on("Borrow", (reserve, user, onBehalfOf) => {
         tracker.addPosition(onBehalfOf);
     });
@@ -115,14 +123,16 @@ function createProvider() {
         console.error("\n[watcher] Error:", err.message);
     });
 
-    // Backrun starts independently 
+    // backrun runs independently via pending
     startBackrunWatcher();
 
-    console.log("[watcher] Connected — liquidation + arb + backrun active");
+    console.log("[watcher] Connected — all 4 strategies active");
     console.log("[watcher] Watching pairs:", WATCH_PAIRS.map(p => p.label).join(", "));
+    console.log("[watcher] Protected users:", protectedUsers.size);
 }
 
-// STRATEGY 1 — LIQUIDATION
+
+// STRATEGY 1 — LIQUIDATION //
 
 async function runLiquidationStrategy(blockNumber) {
     const tasks = [];
@@ -139,7 +149,6 @@ async function checkPosition(address, blockNumber) {
         const parsed = parseAccountData(raw);
         stats.liqChecked++;
 
-        // type(uint256).max = no debt — remove and skip
         if (parsed.totalDebtUsd === 0n || parsed.healthFactor > ethers.parseUnits("1000", 18)) {
             tracker.removePosition(address);
             return;
@@ -149,9 +158,9 @@ async function checkPosition(address, blockNumber) {
 
         if (parsed.isLiquidatable) {
             console.log(`[liq] LIQUIDATABLE: ${address} HF: ${formatHF(parsed.healthFactor)}`);
-            console.log("[liq] WOULD EMIT signal"); // replaced in Part 5
+            await handleLiquidatable(address, parsed, blockNumber);
         } else if (parsed.isDangerZone) {
-            console.log(`[liq] DANGER ZONE: ${address} HF: ${formatHF(parsed.healthFactor)}`);
+            console.log(`[liq] DANGER ZONE:  ${address} HF: ${formatHF(parsed.healthFactor)}`);
         }
 
     } catch (err) {
@@ -159,7 +168,44 @@ async function checkPosition(address, blockNumber) {
     }
 }
 
-// STRATEGY 2 — ARBITRAGE
+async function handleLiquidatable(address, parsed, blockNumber) {
+    try {
+        const reserves = await getUserReserves(address);
+        if (!reserves) return;
+
+        const bestCollateral = pickBestCollateral(reserves);
+        const bestDebt = pickBestDebt(reserves);
+        if (!bestCollateral || !bestDebt) return;
+
+        const debtAmount = getMaxDebtToRepay(bestDebt.totalDebt);
+
+        tracker.markPending(address);
+        stats.liqSignals++;
+
+        const signal = {
+            user: address,
+            debtAsset: bestDebt.asset,
+            collateralAsset: bestCollateral,
+            debtAmount: debtAmount.toString(),
+            healthFactor: formatHF(parsed.healthFactor),
+            blockNumber,
+        };
+
+        console.log(`[liq] SIGNAL #${stats.liqSignals} — WOULD EMIT LIQUIDATABLE`);
+        console.log(`      user:       ${signal.user.slice(0, 10)}...`);
+        console.log(`      debtAsset:  ${signal.debtAsset}`);
+        console.log(`      collateral: ${signal.collateralAsset}`);
+        console.log(`      debtAmount: ${signal.debtAmount}`);
+        console.log(`      HF:         ${signal.healthFactor}`);
+
+    } catch (err) {
+        tracker.clearPending(address);
+        console.log(`[liq] handleLiquidatable error:`, err.message);
+    }
+}
+
+
+// STRATEGY 2 — ARBITRAGE //
 
 async function runArbStrategy(blockNumber) {
     if (isArbScanning) {
@@ -217,12 +263,9 @@ async function scanArbPair(pair, blockNumber) {
             pair: pair.label,
         };
 
-        console.log(
-            `\n[arb] ARB SIGNAL #${stats.arbSignals}` +
-            `\n      Tip to builder: ${profitAnalysis.recommendedTipETH} ETH` +
-            `\n      You keep:       ${profitAnalysis.keeperProfitETH} ETH`
-        );
-        console.log("[arb] WOULD EMIT ARB_SIGNAL", JSON.stringify(signal, null, 2));
+        console.log(`[arb] SIGNAL #${stats.arbSignals} — WOULD EMIT ARB_SIGNAL`);
+        console.log(`      Tip to builder: ${profitAnalysis.recommendedTipETH} ETH`);
+        console.log(`      You keep:       ${profitAnalysis.keeperProfitETH} ETH`);
 
     } catch (err) {
         console.error(`\n[arb] Error scanning ${pair.label}:`, err.message);
@@ -239,7 +282,6 @@ function startBackrunWatcher() {
 
     provider.on("pending", async (txHash) => {
         pendingCount++;
-
         if (pendingCount % 50 === 0) {
             process.stdout.write(`\r[backrun] Pending txs seen: ${pendingCount}`);
         }
@@ -249,32 +291,15 @@ function startBackrunWatcher() {
         try {
             const tx = await provider.getTransaction(txHash);
             if (!tx || !tx.to) return;
-
-            // we only care about known DEX routers
             if (!KNOWN_ROUTERS.has(tx.to.toLowerCase())) return;
-
-            // we only care about swaps above size threshold
             if (tx.value < BACKRUN_MIN_SWAP_ETH) return;
 
-            // mark as seen — prevent duplicate processing
             backrunSeen.add(txHash);
             if (backrunSeen.size > 500) {
                 backrunSeen.delete(backrunSeen.values().next().value);
             }
 
             const valueEth = parseFloat(ethers.formatEther(tx.value)).toFixed(4);
-
-            console.log(
-                `\n[backrun] Large swap detected!` +
-                `\n          TxHash: ${txHash}` +
-                `\n          To:     ${tx.to}` +
-                `\n          Value:  ${valueEth} ETH` +
-                `\n          From:   ${tx.from}` +
-                `\n          Gas:    ${tx.maxFeePerGas
-                    ? ethers.formatUnits(tx.maxFeePerGas, "gwei") + " gwei"
-                    : "legacy"}`
-            );
-
             stats.backrunSignals++;
 
             const signal = {
@@ -287,16 +312,18 @@ function startBackrunWatcher() {
                 data: tx.data,
             };
 
-            console.log("[backrun] WOULD EMIT BACKRUN_TARGET"); //will be replaced later
+            console.log(`\n[backrun] SIGNAL #${stats.backrunSignals} — WOULD EMIT BACKRUN_TARGET`);
+            console.log(`          TxHash: ${txHash}`);
+            console.log(`          Value:  ${valueEth} ETH`);
+            console.log(`          From:   ${tx.from}`);
+            console.log(`          To:     ${tx.to}`);
+            console.log(`          Gas:    ${tx.maxFeePerGas
+                ? ethers.formatUnits(tx.maxFeePerGas, "gwei") + " gwei"
+                : "legacy"}`);
 
-            console.log("[backrun] Signal:", JSON.stringify(signal, null, 2));
-
-        } catch (_) {
-            // tx may have been dropped from mempool — silent fail
-        }
+        } catch (_) { }
     });
 }
-
 
 
 // STRATEGY 4 — PROTECTION //
@@ -317,12 +344,10 @@ async function checkProtectionNeeded(address, blockNumber) {
         const raw = await aavePool.getUserAccountData(address);
         const parsed = parseAccountData(raw);
 
-        // no debt — skip
         if (parsed.totalDebtUsd === 0n || parsed.healthFactor > ethers.parseUnits("1000", 18)) {
             return;
         }
 
-        // HF still safe — skip
         if (parsed.healthFactor > HF_PROTECTION_THRESHOLD) return;
 
         console.log(
@@ -336,13 +361,11 @@ async function checkProtectionNeeded(address, blockNumber) {
         const bestDebt = pickBestDebt(reserves);
         if (!bestDebt) return;
 
-        // 25% repay — gentler than liquidation's 50%
         const repayAmount = (bestDebt.totalDebt * 25n) / 100n;
 
         protectionPending.add(address);
         stats.protectionSignals++;
 
-        // signal payload — wire to emitter later
         const signal = {
             user: address,
             debtAsset: bestDebt.asset,
@@ -369,10 +392,39 @@ function clearProtectionPending(address) {
     protectionPending.delete(address.toLowerCase());
 }
 
+
+// SHARED UTILS //
+
+async function getUserReserves(userAddress) {
+    const tokenList = Object.values(TOKENS);
+    try {
+        const results = await Promise.all(
+            tokenList.map(async (token) => {
+                try {
+                    const data = await aavePool.getUserReserveData(token.address, userAddress);
+                    const price = await aaveOracle.getAssetPrice(token.address);
+                    return {
+                        asset: token.address,
+                        currentATokenBalance: data.currentATokenBalance,
+                        currentVariableDebt: data.currentVariableDebt,
+                        currentStableDebt: data.currentStableDebt,
+                        usageAsCollateralEnabled: data.usageAsCollateralEnabled,
+                        priceUsd: price,
+                    };
+                } catch { return null; }
+            })
+        );
+        return results.filter(Boolean);
+    } catch (_) {
+        return null;
+    }
+}
+
 async function runInBatches(promises, batchSize) {
     for (let i = 0; i < promises.length; i += batchSize) {
         await Promise.allSettled(promises.slice(i, i + batchSize));
     }
 }
+
 
 createProvider();

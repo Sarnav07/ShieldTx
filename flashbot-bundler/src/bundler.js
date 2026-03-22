@@ -105,10 +105,8 @@ function emitMockArbSignal() {
         tokenIn: SEPOLIA_WETH,
         tokenOut: SEPOLIA_USDC,
         amountIn: ethers.parseEther("0.05").toString(),
-        dexA: SEPOLIA_ADDRESSES.SWAP_ROUTER_02,
-        dexB: SEPOLIA_ADDRESSES.SWAP_ROUTER_02,
-        buyFee: 500,
-        sellFee: 3000,
+        buyOnUniswap: true,
+        uniswapFee: 3000,
         expectedProfitRaw: "100000000000000",
     };
 
@@ -130,16 +128,14 @@ const iface = new ethers.Interface(ABI);
 
 function encodeLiquidationTx(signal) {
     const minProfit = 0;
-    const poolFee = 3000;
 
     return iface.encodeFunctionData("executeLiquidation", [
         signal.collateralAsset,
         signal.debtAsset,
         signal.borrower,
         signal.maxDebtToRepay,
-        false,
+        false, // receiveAToken
         minProfit,
-        poolFee,
     ]);
 }
 
@@ -150,8 +146,8 @@ function encodeArbitrageTx(signal) {
         signal.tokenIn,
         signal.tokenOut,
         signal.amountIn,
-        signal.dexA,
-        signal.dexB,
+        signal.buyOnUniswap,
+        signal.uniswapFee,
         minProfit,
     ]);
 }

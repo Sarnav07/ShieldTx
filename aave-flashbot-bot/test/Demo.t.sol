@@ -42,8 +42,7 @@ contract DemoTest is Test {
             UNDERWATER_USER,
             500e6,
             false,
-            1e6, // min 1 USDC profit
-            3000 // 0.3% Uniswap pool
+            1e6 // min 1 USDC profit
         );
 
         uint256 profit = IERC20(USDC).balanceOf(address(liquidator)) - before;

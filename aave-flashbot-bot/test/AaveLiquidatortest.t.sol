@@ -15,10 +15,9 @@ contract AaveLiquidatorTest is Test {
     address constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
 
     address constant UNDERWATER_USER =
-        0x1000000000000000000000000000000000000000; // need to put a real address
+        0x1000000000000000000000000000000000000000;
 
     function setUp() public {
-        // fork mainnet at known block
         vm.createSelectFork(vm.envString("ALCHEMY_RPC_URL"), 19500000);
         liquidator = new AaveLiquidator(
             0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2, // mainnet Aave
@@ -39,8 +38,7 @@ contract AaveLiquidatorTest is Test {
             address(0),
             1000000,
             false,
-            0,
-            3000
+            0
         );
     }
 
@@ -50,18 +48,59 @@ contract AaveLiquidatorTest is Test {
         liquidator.executeOperation(USDC, 1e6, 500, address(this), "");
     }
 
+    function test_arbitrageAccessControl() public {
+        vm.prank(address(0xdead));
+        vm.expectRevert("Not Owner");
+        liquidator.executeArbitrage(USDC, WETH, 1000e6, true, 3000, 1e6);
+    }
+
+    function test_backrunAccessControl() public {
+        vm.prank(address(0xdead));
+        vm.expectRevert("Not Owner");
+        liquidator.executeBackrun(
+            USDC,
+            WETH,
+            1000e6,
+            true,
+            3000,
+            1e6,
+            bytes32(0)
+        );
+    }
+
+    function test_protectionAccessControl() public {
+        vm.prank(address(0xdead));
+        vm.expectRevert("Not Owner");
+        liquidator.executeProtection(address(0x123), USDC, 100e6);
+    }
+
     function test_flashLoanRoundTrip() public {
         deal(USDC, address(liquidator), 1000e6);
 
         vm.expectRevert();
-        liquidator.executeLiquidation(
-            WETH,
-            USDC,
-            address(0),
-            100e6,
-            false,
-            0,
-            3000
+        liquidator.executeLiquidation(WETH, USDC, address(0), 100e6, false, 0);
+    }
+
+    function test_protectionRegistration() public {
+        liquidator.registerProtection(address(0x123), 1.2e18);
+        assertTrue(liquidator.protectedUsers(address(0x123)));
+        assertEq(liquidator.protectionThreshold(address(0x123)), 1.2e18);
+    }
+
+    function test_unregisteredProtectionReverts() public {
+        vm.expectRevert("User not registered");
+        liquidator.executeProtection(address(0xdead), USDC, 100e6);
+    }
+
+    function test_fundContract() public {
+        deal(USDC, address(this), 1000e6);
+        IERC20(USDC).approve(address(liquidator), 1000e6);
+        liquidator.fund(USDC, 1000e6);
+
+        assertEq(
+            IERC20(USDC).balanceOf(address(liquidator)),
+            1000e6,
+            "Contract should hold funded amount"
         );
     }
 
@@ -108,26 +147,17 @@ contract AaveLiquidatorTest is Test {
         liquidator.withdrawETH();
     }
 
-    // ===================== FULL LIQUIDATION (needs real underwater user) =====================
+    function test_simulateLiquidation() public view {
+        (
+            uint256 expectedProfit,
+            uint256 flashLoanFee,
+            bool isProfitable
+        ) = liquidator.simulateLiquidation(WETH, USDC, UNDERWATER_USER, 500e6);
 
-    // Uncomment when you find a real underwater user at block 19500000
-    // function test_fullLiquidation() public {
-    //     // 1. verify position is underwater
-    //     (,,,,,uint256 hf) = IPool(AAVE_POOL).getUserAccountData(UNDERWATER_USER);
-    //     assertLt(hf, 1e18, "User should be underwater");
-    //
-    //     // 2. record balances before
-    //     uint256 usdcBefore = IERC20(USDC).balanceOf(address(liquidator));
-    //
-    //     // 3. execute with 0.3% Uniswap pool, 1 USDC minimum profit
-    //     liquidator.executeLiquidation(WETH, USDC, UNDERWATER_USER, 500e6, false, 1e6, 3000);
-    //
-    //     // 4. verify profit
-    //     uint256 profit = IERC20(USDC).balanceOf(address(liquidator)) - usdcBefore;
-    //     assertGt(profit, 1e6, "Profit should exceed minimum");
-    //     emit log_named_uint("Net profit USDC", profit);
-    //     emit log_named_uint("Profit in dollars", profit / 1e6);
-    // }
+        assertTrue(isProfitable, "Should estimate as profitable");
+        assertGt(expectedProfit, 0, "Expected profit should be > 0");
+        assertEq(flashLoanFee, 25e4, "Fee should be 0.05% of 500e6");
+    }
 
     receive() external payable {}
 }

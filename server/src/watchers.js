@@ -40,7 +40,8 @@ let stats = {
     liqSignals: 0,
     arbScans: 0,
     arbSignals: 0,
-    backrunSignals: 0, // ← new
+    backrunSignals: 0,
+    protectionSignals: 0
 };
 
 //Arb config 
@@ -59,6 +60,13 @@ const KNOWN_ROUTERS = new Set([
     "0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD".toLowerCase(), // UniversalRouter mainnet
 ]);
 const backrunSeen = new Set();
+
+//Protection config
+
+const HF_PROTECTION_THRESHOLD = ethers.parseUnits("1.1", 18);
+const protectedUsers = new Set([]);
+const protectionPending = new Set();
+
 
 
 // PROVIDER SETUP
@@ -85,11 +93,13 @@ function createProvider() {
             `Pos: ${tracker.getSize()} | ` +
             `LiqSig: ${stats.liqSignals} | ` +
             `ArbSig: ${stats.arbSignals} | ` +
-            `BR: ${stats.backrunSignals}`
+            `BR: ${stats.backrunSignals} | ` +
+            `Prot: ${stats.protectionSignals}`
         );
         await Promise.allSettled([
             runLiquidationStrategy(blockNumber),
             runArbStrategy(blockNumber),
+            runProtectionStrategy(blockNumber),
         ]);
     });
 
@@ -285,6 +295,78 @@ function startBackrunWatcher() {
             // tx may have been dropped from mempool — silent fail
         }
     });
+}
+
+
+
+// STRATEGY 4 — PROTECTION //
+
+async function runProtectionStrategy(blockNumber) {
+    if (protectedUsers.size === 0) return;
+
+    const tasks = [];
+    for (const address of protectedUsers) {
+        if (protectionPending.has(address)) continue;
+        tasks.push(checkProtectionNeeded(address, blockNumber));
+    }
+    await runInBatches(tasks, 10);
+}
+
+async function checkProtectionNeeded(address, blockNumber) {
+    try {
+        const raw = await aavePool.getUserAccountData(address);
+        const parsed = parseAccountData(raw);
+
+        // no debt — skip
+        if (parsed.totalDebtUsd === 0n || parsed.healthFactor > ethers.parseUnits("1000", 18)) {
+            return;
+        }
+
+        // HF still safe — skip
+        if (parsed.healthFactor > HF_PROTECTION_THRESHOLD) return;
+
+        console.log(
+            `\n[protection] User needs help: ${address.slice(0, 10)}...` +
+            ` HF: ${formatHF(parsed.healthFactor)}`
+        );
+
+        const reserves = await getUserReserves(address);
+        if (!reserves) return;
+
+        const bestDebt = pickBestDebt(reserves);
+        if (!bestDebt) return;
+
+        // 25% repay — gentler than liquidation's 50%
+        const repayAmount = (bestDebt.totalDebt * 25n) / 100n;
+
+        protectionPending.add(address);
+        stats.protectionSignals++;
+
+        // signal payload — wire to emitter later
+        const signal = {
+            user: address,
+            debtAsset: bestDebt.asset,
+            repayAmount: repayAmount.toString(),
+            healthFactor: formatHF(parsed.healthFactor),
+            blockNumber,
+        };
+
+        console.log(`[protection] SIGNAL #${stats.protectionSignals} — WOULD EMIT PROTECTION_NEEDED`);
+        console.log(`             user:        ${signal.user.slice(0, 10)}...`);
+        console.log(`             debtAsset:   ${signal.debtAsset}`);
+        console.log(`             repayAmount: ${signal.repayAmount}`);
+        console.log(`             HF:          ${signal.healthFactor}`);
+
+    } catch (err) {
+        console.log(
+            `[protection] skip ${address.slice(0, 10)}:`,
+            err.shortMessage || err.message
+        );
+    }
+}
+
+function clearProtectionPending(address) {
+    protectionPending.delete(address.toLowerCase());
 }
 
 async function runInBatches(promises, batchSize) {

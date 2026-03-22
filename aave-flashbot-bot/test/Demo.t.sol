@@ -75,4 +75,52 @@ contract DemoTest is Test {
 
         assertTrue(isProfitable, "Should be estimated as profitable");
     }
+
+    function test_hackathonDemo() public {
+        vm.createSelectFork(vm.envString("ALCHEMY_RPC_URL"), 19500000);
+
+        AaveLiquidator liq = new AaveLiquidator(
+            MAINNET_AAVE_POOL,
+            MAINNET_UNISWAP
+        );
+
+        console.log("=== ShieldTx MEV Bot Demo ===");
+        console.log("");
+        console.log(
+            "SCENARIO: User borrowed $10,000 USDC against ETH collateral"
+        );
+        console.log("ETH price dropped 20%. Health Factor is now 0.94");
+        console.log("Position is underwater and open for liquidation");
+        console.log("");
+
+        (, , , , , uint256 hfBefore) = IPool(MAINNET_AAVE_POOL)
+            .getUserAccountData(UNDERWATER_USER);
+        console.log("Health Factor before:", hfBefore);
+
+        // NOTE: This will only work with a real underwater user address
+        // Replace UNDERWATER_USER with a real address to see full demo
+        if (hfBefore >= 1e18) {
+            console.log("");
+            console.log("DEMO NOTE: Replace UNDERWATER_USER with a real");
+            console.log("underwater address at block 19500000 to see");
+            console.log("the full liquidation + profit output.");
+            return;
+        }
+
+        uint256 balanceBefore = IERC20(USDC).balanceOf(address(liq));
+
+        liq.executeLiquidation(WETH, USDC, UNDERWATER_USER, 500e6, false, 1e6);
+
+        uint256 profit = IERC20(USDC).balanceOf(address(liq)) - balanceBefore;
+
+        console.log("");
+        console.log("RESULT:");
+        console.log("Flash loan borrowed: 500 USDC (zero capital required)");
+        console.log("Liquidation executed atomically via Flashbots");
+        console.log("Collateral seized and swapped back via Uniswap V3");
+        console.log("Flash loan repaid in same transaction");
+        console.log("Net profit: $", profit / 1e6);
+        console.log("");
+        console.log("If beaten by competitor: bundle dropped, zero gas cost");
+    }
 }

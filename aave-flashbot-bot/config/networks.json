@@ -1,0 +1,16 @@
+{
+    "mainnet": {
+        "chainId": 1,
+        "aavePool": "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2",
+        "uniswapRouter": "0xE592427A0AEce92De3Edee1F18E0157C05861564",
+        "sushiswapRouter": "0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F",
+        "flashbotsRelay": "https://relay.flashbots.net"
+    },
+    "sepolia": {
+        "chainId": 11155111,
+        "aavePool": "0x6Ae43d3271ff6888e7Fc43Fd7321a503ff738951",
+        "uniswapRouter": "0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E",
+        "contractAddress": "0x847335923C5D3d70791349E3b5d3Ed65739758c2",
+        "flashbotsRelay": "https://relay-sepolia.flashbots.net"
+    }
+}

@@ -1,5 +1,10 @@
+//replaced console with emit and actionable payload
+
 require("dotenv").config();
 const { ethers } = require("ethers");
+
+
+const signalEmitter = require("./signalEmitter");
 
 const {
     AAVE_ORACLE_ADDRESS,
@@ -28,7 +33,9 @@ const {
     ARB_CONFIG,
 } = require("../../flashbot-bundler/src/arbCalculator");
 
-// State 
+
+// STATE //
+
 let provider;
 let aavePool;
 let aaveOracle;
@@ -41,10 +48,13 @@ let stats = {
     arbScans: 0,
     arbSignals: 0,
     backrunSignals: 0,
-    protectionSignals: 0
+    protectionSignals: 0,
 };
 
-//Arb config 
+
+// CONFIG //
+
+
 const WATCH_PAIRS = [
     {
         tokenIn: process.env.MAINNET_WETH,
@@ -53,30 +63,35 @@ const WATCH_PAIRS = [
     },
 ];
 
-//Backrun config 
-const BACKRUN_MIN_SWAP_ETH = ethers.parseEther("1.0"); // 1 ETH min on mainnet
+const BACKRUN_MIN_SWAP_ETH = ethers.parseEther("1.0");
 const KNOWN_ROUTERS = new Set([
-    "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45".toLowerCase(), // SwapRouter02 mainnet
-    "0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD".toLowerCase(), // UniversalRouter mainnet
+    "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45".toLowerCase(),
+    "0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD".toLowerCase(),
 ]);
 const backrunSeen = new Set();
-
-//Protection config
 
 const HF_PROTECTION_THRESHOLD = ethers.parseUnits("1.1", 18);
 const protectedUsers = new Set([]);
 const protectionPending = new Set();
 
+// ── Uniswap V3 swap function selector for calldata decoding ───────
+// exactInputSingle selector = 0x414bf389
+// exactInput selector       = 0xc04b8d59
+const SWAP_SELECTORS = new Set([
+    "0x414bf389", // exactInputSingle
+    "0xc04b8d59", // exactInput
+    "0xdb3e2198", // exactOutputSingle
+    "0xf28c0498", // exactOutput
+]);
 
-
+// 
 // PROVIDER SETUP
-
+// 
 function createProvider() {
     provider = new ethers.WebSocketProvider(process.env.RPC_WSS);
     aavePool = new ethers.Contract(AAVE_POOL_ADDRESS, AAVE_POOL_ABI, provider);
     aaveOracle = new ethers.Contract(AAVE_ORACLE_ADDRESS, AAVE_ORACLE_ABI, provider);
 
-    //will reconnect if no block in 30s
     const watchdog = setInterval(() => {
         if (Date.now() - lastBlockTime > 30_000) {
             console.log("\n[watcher] No block in 30s — reconnecting...");
@@ -85,7 +100,6 @@ function createProvider() {
         }
     }, 5_000);
 
-    // Block listener — liquidation + arb in parallel
     provider.on("block", async (blockNumber) => {
         lastBlockTime = Date.now();
         process.stdout.write(
@@ -103,7 +117,6 @@ function createProvider() {
         ]);
     });
 
-    // Auto-discover new borrowers
     aavePool.on("Borrow", (reserve, user, onBehalfOf) => {
         tracker.addPosition(onBehalfOf);
     });
@@ -115,15 +128,15 @@ function createProvider() {
         console.error("\n[watcher] Error:", err.message);
     });
 
-    // Backrun starts independently 
     startBackrunWatcher();
 
-    console.log("[watcher] Connected — liquidation + arb + backrun active");
+    console.log("[watcher] Connected — all 4 strategies active");
     console.log("[watcher] Watching pairs:", WATCH_PAIRS.map(p => p.label).join(", "));
 }
 
+// 
 // STRATEGY 1 — LIQUIDATION
-
+// 
 async function runLiquidationStrategy(blockNumber) {
     const tasks = [];
     for (const [address] of tracker.getAll()) {
@@ -139,7 +152,6 @@ async function checkPosition(address, blockNumber) {
         const parsed = parseAccountData(raw);
         stats.liqChecked++;
 
-        // type(uint256).max = no debt — remove and skip
         if (parsed.totalDebtUsd === 0n || parsed.healthFactor > ethers.parseUnits("1000", 18)) {
             tracker.removePosition(address);
             return;
@@ -149,7 +161,7 @@ async function checkPosition(address, blockNumber) {
 
         if (parsed.isLiquidatable) {
             console.log(`[liq] LIQUIDATABLE: ${address} HF: ${formatHF(parsed.healthFactor)}`);
-            console.log("[liq] WOULD EMIT signal"); // replaced in Part 5
+            await handleLiquidatable(address, parsed, blockNumber);
         } else if (parsed.isDangerZone) {
             console.log(`[liq] DANGER ZONE: ${address} HF: ${formatHF(parsed.healthFactor)}`);
         }
@@ -159,13 +171,57 @@ async function checkPosition(address, blockNumber) {
     }
 }
 
-// STRATEGY 2 — ARBITRAGE
 
-async function runArbStrategy(blockNumber) {
-    if (isArbScanning) {
-        console.log(`\n[arb] Block ${blockNumber} — scan still running, skipping`);
-        return;
+async function handleLiquidatable(address, parsed, blockNumber) {
+    try {
+        // fetch per-token reserves to find best debt and collateral
+        const reserves = await getUserReserves(address);
+        if (!reserves || reserves.length === 0) return;
+
+        const bestCollateral = pickBestCollateral(reserves);
+        const bestDebt = pickBestDebt(reserves);
+
+        if (!bestCollateral || !bestDebt) {
+            console.log(`[liq] could not determine best assets for ${address.slice(0, 10)}`);
+            return;
+        }
+
+        // apply 50% close factor — Aave only allows repaying half
+        const debtAmount = getMaxDebtToRepay(bestDebt.totalDebt);
+
+        tracker.markPending(address);
+        stats.liqSignals++;
+
+        // full actionable payload C needs to build the bundle
+        const signal = {
+            user: address,
+            debtAsset: bestDebt.asset,
+            collateralAsset: bestCollateral,
+            debtAmount: debtAmount,        // BigInt — C uses this directly
+            healthFactor: parsed.healthFactor,
+            blockNumber,
+        };
+
+        console.log(`[liq] Signal #${stats.liqSignals} emitted`);
+        console.log(`      user:       ${signal.user.slice(0, 10)}...`);
+        console.log(`      debtAsset:  ${signal.debtAsset}`);
+        console.log(`      collateral: ${signal.collateralAsset}`);
+        console.log(`      debtAmount: ${signal.debtAmount.toString()}`);
+
+
+        signalEmitter.emit("liquidation", signal);
+
+    } catch (err) {
+        tracker.clearPending(address);
+        console.log(`[liq] handleLiquidatable error:`, err.message);
     }
+}
+
+//
+// STRATEGY 2 — ARBITRAGE
+// 
+async function runArbStrategy(blockNumber) {
+    if (isArbScanning) return;
     isArbScanning = true;
     try {
         await Promise.allSettled(
@@ -204,7 +260,7 @@ async function scanArbPair(pair, blockNumber) {
         );
 
         if (!profitAnalysis.isWorthIt) {
-            console.log(`[arb] Below threshold (${ARB_CONFIG.MIN_PROFIT_ETH} ETH) — skipping`);
+            console.log(`[arb] Below threshold — skipping`);
             return;
         }
 
@@ -217,21 +273,19 @@ async function scanArbPair(pair, blockNumber) {
             pair: pair.label,
         };
 
-        console.log(
-            `\n[arb] ARB SIGNAL #${stats.arbSignals}` +
-            `\n      Tip to builder: ${profitAnalysis.recommendedTipETH} ETH` +
-            `\n      You keep:       ${profitAnalysis.keeperProfitETH} ETH`
-        );
-        console.log("[arb] WOULD EMIT ARB_SIGNAL", JSON.stringify(signal, null, 2));
+        console.log(`[arb] Signal #${stats.arbSignals} emitted`);
+
+        // ── Issue 1 fix: real emit ────────────────────────────────
+        signalEmitter.emit("arbitrage", signal);
 
     } catch (err) {
         console.error(`\n[arb] Error scanning ${pair.label}:`, err.message);
     }
 }
 
-
-// STRATEGY 3 — BACKRUN //
-
+// 
+// STRATEGY 3 — BACKRUN
+// 
 function startBackrunWatcher() {
     console.log("[backrun] Watching mempool...");
 
@@ -239,7 +293,6 @@ function startBackrunWatcher() {
 
     provider.on("pending", async (txHash) => {
         pendingCount++;
-
         if (pendingCount % 50 === 0) {
             process.stdout.write(`\r[backrun] Pending txs seen: ${pendingCount}`);
         }
@@ -249,14 +302,9 @@ function startBackrunWatcher() {
         try {
             const tx = await provider.getTransaction(txHash);
             if (!tx || !tx.to) return;
-
-            // we only care about known DEX routers
             if (!KNOWN_ROUTERS.has(tx.to.toLowerCase())) return;
-
-            // we only care about swaps above size threshold
             if (tx.value < BACKRUN_MIN_SWAP_ETH) return;
 
-            // mark as seen — prevent duplicate processing
             backrunSeen.add(txHash);
             if (backrunSeen.size > 500) {
                 backrunSeen.delete(backrunSeen.values().next().value);
@@ -264,16 +312,7 @@ function startBackrunWatcher() {
 
             const valueEth = parseFloat(ethers.formatEther(tx.value)).toFixed(4);
 
-            console.log(
-                `\n[backrun] Large swap detected!` +
-                `\n          TxHash: ${txHash}` +
-                `\n          To:     ${tx.to}` +
-                `\n          Value:  ${valueEth} ETH` +
-                `\n          From:   ${tx.from}` +
-                `\n          Gas:    ${tx.maxFeePerGas
-                    ? ethers.formatUnits(tx.maxFeePerGas, "gwei") + " gwei"
-                    : "legacy"}`
-            );
+            const decoded = decodeSwapCalldata(tx.data);
 
             stats.backrunSignals++;
 
@@ -285,22 +324,74 @@ function startBackrunWatcher() {
                 gasPrice: tx.maxFeePerGas?.toString() || tx.gasPrice?.toString(),
                 from: tx.from,
                 data: tx.data,
+                // decoded swap details
+                tokenIn: decoded?.tokenIn || null,
+                tokenOut: decoded?.tokenOut || null,
+                amountIn: decoded?.amountIn || null,
             };
 
-            console.log("[backrun] WOULD EMIT BACKRUN_TARGET"); //will be replaced later
+            console.log(`\n[backrun] Signal #${stats.backrunSignals} emitted`);
+            console.log(`          TxHash:   ${txHash.slice(0, 12)}...`);
+            console.log(`          Value:    ${valueEth} ETH`);
+            console.log(`          TokenIn:  ${signal.tokenIn || "could not decode"}`);
+            console.log(`          TokenOut: ${signal.tokenOut || "could not decode"}`);
+            console.log(`          AmountIn: ${signal.amountIn || "could not decode"}`);
 
-            console.log("[backrun] Signal:", JSON.stringify(signal, null, 2));
+            //emit
+            signalEmitter.emit("backrun", signal);
 
-        } catch (_) {
-            // tx may have been dropped from mempool — silent fail
-        }
+        } catch (_) { }
     });
 }
 
+function decodeSwapCalldata(data) {
+    if (!data || data.length < 10) return null;
 
+    const selector = data.slice(0, 10).toLowerCase();
 
-// STRATEGY 4 — PROTECTION //
+    try {
+        // exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))
+        if (selector === "0x414bf389") {
+            const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+            const decoded = abiCoder.decode(
+                ["tuple(address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 deadline,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96)"],
+                "0x" + data.slice(10)
+            );
+            return {
+                tokenIn: decoded[0].tokenIn,
+                tokenOut: decoded[0].tokenOut,
+                amountIn: decoded[0].amountIn.toString(),
+            };
+        }
 
+        // exactInput((bytes,address,uint256,uint256,uint256))
+        if (selector === "0xc04b8d59") {
+            const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+            const decoded = abiCoder.decode(
+                ["tuple(bytes path,address recipient,uint256 deadline,uint256 amountIn,uint256 amountOutMinimum)"],
+                "0x" + data.slice(10)
+            );
+            // path is encoded as bytes — first 20 bytes = tokenIn, last 20 bytes = tokenOut
+            const path = decoded[0].path;
+            const tokenIn = "0x" + path.slice(2, 42);
+            const tokenOut = "0x" + path.slice(path.length - 40);
+            return {
+                tokenIn,
+                tokenOut,
+                amountIn: decoded[0].amountIn.toString(),
+            };
+        }
+
+    } catch (_) {
+        return null;
+    }
+
+    return null;
+}
+
+// 
+// STRATEGY 4 — PROTECTION
+// 
 async function runProtectionStrategy(blockNumber) {
     if (protectedUsers.size === 0) return;
 
@@ -317,12 +408,9 @@ async function checkProtectionNeeded(address, blockNumber) {
         const raw = await aavePool.getUserAccountData(address);
         const parsed = parseAccountData(raw);
 
-        // no debt — skip
         if (parsed.totalDebtUsd === 0n || parsed.healthFactor > ethers.parseUnits("1000", 18)) {
             return;
         }
-
-        // HF still safe — skip
         if (parsed.healthFactor > HF_PROTECTION_THRESHOLD) return;
 
         console.log(
@@ -336,26 +424,23 @@ async function checkProtectionNeeded(address, blockNumber) {
         const bestDebt = pickBestDebt(reserves);
         if (!bestDebt) return;
 
-        // 25% repay — gentler than liquidation's 50%
         const repayAmount = (bestDebt.totalDebt * 25n) / 100n;
 
         protectionPending.add(address);
         stats.protectionSignals++;
 
-        // signal payload — wire to emitter later
         const signal = {
             user: address,
             debtAsset: bestDebt.asset,
-            repayAmount: repayAmount.toString(),
-            healthFactor: formatHF(parsed.healthFactor),
+            repayAmount,
+            healthFactor: parsed.healthFactor,
             blockNumber,
         };
 
-        console.log(`[protection] SIGNAL #${stats.protectionSignals} — WOULD EMIT PROTECTION_NEEDED`);
-        console.log(`             user:        ${signal.user.slice(0, 10)}...`);
-        console.log(`             debtAsset:   ${signal.debtAsset}`);
-        console.log(`             repayAmount: ${signal.repayAmount}`);
-        console.log(`             HF:          ${signal.healthFactor}`);
+        console.log(`[protection] Signal #${stats.protectionSignals} emitted`);
+
+        //
+        signalEmitter.emit("protection", signal);
 
     } catch (err) {
         console.log(
@@ -369,10 +454,37 @@ function clearProtectionPending(address) {
     protectionPending.delete(address.toLowerCase());
 }
 
+// 
+// SHARED UTILS
+// 
+async function getUserReserves(userAddress) {
+    const tokenList = Object.values(TOKENS);
+    try {
+        const results = await Promise.all(
+            tokenList.map(async (token) => {
+                try {
+                    const data = await aavePool.getUserReserveData(token.address, userAddress);
+                    const price = await aaveOracle.getAssetPrice(token.address);
+                    return {
+                        asset: token.address,
+                        currentATokenBalance: data.currentATokenBalance,
+                        currentVariableDebt: data.currentVariableDebt,
+                        currentStableDebt: data.currentStableDebt,
+                        usageAsCollateralEnabled: data.usageAsCollateralEnabled,
+                        priceUsd: price,
+                    };
+                } catch { return null; }
+            })
+        );
+        return results.filter(Boolean);
+    } catch (_) {
+        return null;
+    }
+}
+
 async function runInBatches(promises, batchSize) {
     for (let i = 0; i < promises.length; i += batchSize) {
         await Promise.allSettled(promises.slice(i, i + batchSize));
     }
 }
-
 createProvider();

@@ -1,6 +1,5 @@
 require("dotenv").config();
 const { ethers } = require("ethers");
-
 const {
     AAVE_ORACLE_ADDRESS,
     AAVE_ORACLE_ABI,
@@ -12,6 +11,7 @@ const {
 } = require("./constants");
 
 const {
+
     parseAccountData,
     formatHF,
     pickBestCollateral,
@@ -21,12 +21,35 @@ const {
 
 const tracker = require("./positionTracker");
 
-//STATE
+const {
+    findArbOpportunity,
+    calculateArbProfit,
+    toArbSignal,
+    ARB_CONFIG,
+} = require("../../flashbot-bundler/src/arbCalculator");
+
+//STATE//
 
 let provider;
 let aavePool;
 let aaveOracle;
 let lastBlockTime = Date.now();
+let isArbScanning = false;
+let stats = {
+    liqChecked: 0,
+    liqSignals: 0,
+    arbScans: 0,
+    arbSignals: 0,
+};
+
+// Using Sepolia addresses from arbCalculator.js
+const WATCH_PAIRS = [
+    {
+        tokenIn: process.env.SEPOLIA_WETH,
+        tokenOut: process.env.SEPOLIA_USDC,
+        label: "WETH/USDC",
+    },
+];
 
 //PROVIDER SETUP//
 
@@ -37,19 +60,22 @@ function createProvider() {
 
     const watchdog = setInterval(() => {
         if (Date.now() - lastBlockTime > 30_000) {
-            console.log("\n[watcher] Reconnecting...");
+            console.log("\n[watcher] No block in 30s — reconnecting...");
             clearInterval(watchdog);
             createProvider();
         }
     }, 5_000);
 
-    //One block listener
     provider.on("block", async (blockNumber) => {
         lastBlockTime = Date.now();
+
         process.stdout.write(
-            `\r[watcher] Block ${blockNumber} | Positions: ${tracker.getSize()}`
+            `\r[watcher] Block ${blockNumber} | ` +
+            `Pos: ${tracker.getSize()} | ` +
+            `LiqSig: ${stats.liqSignals} | ` +
+            `ArbSig: ${stats.arbSignals}`
         );
-        await runLiquidationStrategy(blockNumber);
+
     });
 
     aavePool.on("Borrow", (reserve, user, onBehalfOf) => {
@@ -63,10 +89,14 @@ function createProvider() {
         console.error("\n[watcher] Error:", err.message);
     });
 
-    console.log("[watcher] Connected");
+    console.log("[watcher] Connected — running liquidation + arb");
+    console.log("[watcher] Watching pairs:", WATCH_PAIRS.map(p => p.label).join(", "));
 }
 
-// STRATEGY 1:LIQUIDATION
+//
+//STRATEGY 1 :LIQUIDATION//
+//
+
 async function runLiquidationStrategy(blockNumber) {
     const tasks = [];
     for (const [address] of tracker.getAll()) {
@@ -80,6 +110,7 @@ async function checkPosition(address, blockNumber) {
     try {
         const raw = await aavePool.getUserAccountData(address);
         const parsed = parseAccountData(raw);
+        stats.liqChecked++;
 
         console.log(`\n[HF] ${address.slice(0, 10)}... → ${formatHF(parsed.healthFactor)}`);
 
@@ -90,13 +121,85 @@ async function checkPosition(address, blockNumber) {
 
         if (parsed.isLiquidatable) {
             console.log(`[liq] LIQUIDATABLE: ${address} HF: ${formatHF(parsed.healthFactor)}`);
-            console.log("[liq] WOULD EMIT signal");
+            console.log("[liq] WOULD EMIT signal");   // replaced in Part 5
         } else if (parsed.isDangerZone) {
             console.log(`[liq] DANGER ZONE: ${address} HF: ${formatHF(parsed.healthFactor)}`);
         }
 
     } catch (err) {
         console.log(`[liq] skip ${address.slice(0, 10)}:`, err.shortMessage || err.message);
+    }
+}
+
+//
+//STRATEGY 2: ARBITRAGE//
+//
+
+async function runArbStrategy(blockNumber) {
+    if (isArbScanning) {
+        console.log(`\n[arb] Block ${blockNumber} — scan still running, skipping`);
+        return;
+    }
+
+    isArbScanning = true;
+
+    try {
+        await Promise.allSettled(
+            WATCH_PAIRS.map(pair => scanArbPair(pair, blockNumber))
+        );
+    } finally {
+        isArbScanning = false;
+    }
+}
+
+async function scanArbPair(pair, blockNumber) {
+    try {
+        stats.arbScans++;
+        const opportunity = await findArbOpportunity(
+            provider,
+            pair.tokenIn,
+            pair.tokenOut
+        );
+
+        if (!opportunity) {
+            console.log(`\n[arb] ${pair.label} Block ${blockNumber} — no opportunity`);
+            return;
+        }
+
+        const profitAnalysis = await calculateArbProfit(opportunity, provider);
+
+        console.log(
+            `\n[arb] ${pair.label} | Block ${blockNumber}` +
+            `\n      Buy fee:  ${opportunity.buyFee / 10000}%` +
+            `\n      Sell fee: ${opportunity.sellFee / 10000}%` +
+            `\n      Gross:    ${profitAnalysis.grossProfitETH} ETH` +
+            `\n      Gas cost: ${profitAnalysis.gasCostETH} ETH` +
+            `\n      Net:      ${profitAnalysis.netProfitETH} ETH` +
+            `\n      Worth it: ${profitAnalysis.isWorthIt}`
+        );
+
+        if (!profitAnalysis.isWorthIt) {
+            console.log(`[arb] Below threshold (${ARB_CONFIG.MIN_PROFIT_ETH} ETH) — skipping`);
+            return;
+        }
+        stats.arbSignals++;
+
+        const signal = {
+            ...toArbSignal(opportunity),
+            profitAnalysis,
+            blockNumber,
+            pair: pair.label,
+        };
+
+        console.log(
+            `\n[arb] ARB SIGNAL #${stats.arbSignals}` +
+            `\n      Tip to builder: ${profitAnalysis.recommendedTipETH} ETH` +
+            `\n      You keep:       ${profitAnalysis.keeperProfitETH} ETH`
+        );
+        console.log("[arb] WOULD EMIT ARB_SIGNAL", JSON.stringify(signal, null, 2));
+
+    } catch (err) {
+        console.error(`\n[arb] Error scanning ${pair.label}:`, err.message);
     }
 }
 

@@ -25,7 +25,7 @@ const {
     calculateArbProfit,
     toArbSignal,
     ARB_CONFIG,
-} = require("./arbCalculator");
+} = require("../../flashbot-bundler/src/arbCalculator");
 let provider;
 let aavePool;
 let aaveOracle;

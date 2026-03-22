@@ -1,5 +1,10 @@
+//replaced console with emit and actionable payload
+
 require("dotenv").config();
 const { ethers } = require("ethers");
+
+
+const signalEmitter = require("./signalEmitter");
 
 const {
     AAVE_ORACLE_ADDRESS,
@@ -28,8 +33,9 @@ const {
     ARB_CONFIG,
 } = require("../../flashbot-bundler/src/arbCalculator");
 
-// STATE
-// 
+
+// STATE //
+
 let provider;
 let aavePool;
 let aaveOracle;
@@ -45,11 +51,10 @@ let stats = {
     protectionSignals: 0,
 };
 
-// 
-// CONFIG
-// 
 
-// Arb
+// CONFIG //
+
+
 const WATCH_PAIRS = [
     {
         tokenIn: process.env.MAINNET_WETH,
@@ -58,7 +63,6 @@ const WATCH_PAIRS = [
     },
 ];
 
-// Backrun
 const BACKRUN_MIN_SWAP_ETH = ethers.parseEther("1.0");
 const KNOWN_ROUTERS = new Set([
     "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45".toLowerCase(),
@@ -66,10 +70,19 @@ const KNOWN_ROUTERS = new Set([
 ]);
 const backrunSeen = new Set();
 
-// Protection
 const HF_PROTECTION_THRESHOLD = ethers.parseUnits("1.1", 18);
 const protectedUsers = new Set([]);
 const protectionPending = new Set();
+
+// ── Uniswap V3 swap function selector for calldata decoding ───────
+// exactInputSingle selector = 0x414bf389
+// exactInput selector       = 0xc04b8d59
+const SWAP_SELECTORS = new Set([
+    "0x414bf389", // exactInputSingle
+    "0xc04b8d59", // exactInput
+    "0xdb3e2198", // exactOutputSingle
+    "0xf28c0498", // exactOutput
+]);
 
 // 
 // PROVIDER SETUP
@@ -79,12 +92,6 @@ function createProvider() {
     aavePool = new ethers.Contract(AAVE_POOL_ADDRESS, AAVE_POOL_ABI, provider);
     aaveOracle = new ethers.Contract(AAVE_ORACLE_ADDRESS, AAVE_ORACLE_ABI, provider);
 
-    // confirm which network we are on
-    provider.getNetwork().then(n =>
-        console.log("\n[watcher] Network:", n.name, "chainId:", n.chainId)
-    );
-
-    // reconnect if no block in 30s
     const watchdog = setInterval(() => {
         if (Date.now() - lastBlockTime > 30_000) {
             console.log("\n[watcher] No block in 30s — reconnecting...");
@@ -92,7 +99,6 @@ function createProvider() {
             createProvider();
         }
     }, 5_000);
-
 
     provider.on("block", async (blockNumber) => {
         lastBlockTime = Date.now();
@@ -111,7 +117,6 @@ function createProvider() {
         ]);
     });
 
-    // auto-discover new borrowers
     aavePool.on("Borrow", (reserve, user, onBehalfOf) => {
         tracker.addPosition(onBehalfOf);
     });
@@ -123,17 +128,15 @@ function createProvider() {
         console.error("\n[watcher] Error:", err.message);
     });
 
-    // backrun runs independently via pending
     startBackrunWatcher();
 
     console.log("[watcher] Connected — all 4 strategies active");
     console.log("[watcher] Watching pairs:", WATCH_PAIRS.map(p => p.label).join(", "));
-    console.log("[watcher] Protected users:", protectedUsers.size);
 }
 
-
-// STRATEGY 1 — LIQUIDATION //
-
+// 
+// STRATEGY 1 — LIQUIDATION
+// 
 async function runLiquidationStrategy(blockNumber) {
     const tasks = [];
     for (const [address] of tracker.getAll()) {
@@ -160,7 +163,7 @@ async function checkPosition(address, blockNumber) {
             console.log(`[liq] LIQUIDATABLE: ${address} HF: ${formatHF(parsed.healthFactor)}`);
             await handleLiquidatable(address, parsed, blockNumber);
         } else if (parsed.isDangerZone) {
-            console.log(`[liq] DANGER ZONE:  ${address} HF: ${formatHF(parsed.healthFactor)}`);
+            console.log(`[liq] DANGER ZONE: ${address} HF: ${formatHF(parsed.healthFactor)}`);
         }
 
     } catch (err) {
@@ -168,35 +171,45 @@ async function checkPosition(address, blockNumber) {
     }
 }
 
+
 async function handleLiquidatable(address, parsed, blockNumber) {
     try {
+        // fetch per-token reserves to find best debt and collateral
         const reserves = await getUserReserves(address);
-        if (!reserves) return;
+        if (!reserves || reserves.length === 0) return;
 
         const bestCollateral = pickBestCollateral(reserves);
         const bestDebt = pickBestDebt(reserves);
-        if (!bestCollateral || !bestDebt) return;
 
+        if (!bestCollateral || !bestDebt) {
+            console.log(`[liq] could not determine best assets for ${address.slice(0, 10)}`);
+            return;
+        }
+
+        // apply 50% close factor — Aave only allows repaying half
         const debtAmount = getMaxDebtToRepay(bestDebt.totalDebt);
 
         tracker.markPending(address);
         stats.liqSignals++;
 
+        // full actionable payload C needs to build the bundle
         const signal = {
             user: address,
             debtAsset: bestDebt.asset,
             collateralAsset: bestCollateral,
-            debtAmount: debtAmount.toString(),
-            healthFactor: formatHF(parsed.healthFactor),
+            debtAmount: debtAmount,        // BigInt — C uses this directly
+            healthFactor: parsed.healthFactor,
             blockNumber,
         };
 
-        console.log(`[liq] SIGNAL #${stats.liqSignals} — WOULD EMIT LIQUIDATABLE`);
+        console.log(`[liq] Signal #${stats.liqSignals} emitted`);
         console.log(`      user:       ${signal.user.slice(0, 10)}...`);
         console.log(`      debtAsset:  ${signal.debtAsset}`);
         console.log(`      collateral: ${signal.collateralAsset}`);
-        console.log(`      debtAmount: ${signal.debtAmount}`);
-        console.log(`      HF:         ${signal.healthFactor}`);
+        console.log(`      debtAmount: ${signal.debtAmount.toString()}`);
+
+
+        signalEmitter.emit("liquidation", signal);
 
     } catch (err) {
         tracker.clearPending(address);
@@ -204,14 +217,11 @@ async function handleLiquidatable(address, parsed, blockNumber) {
     }
 }
 
-
-// STRATEGY 2 — ARBITRAGE //
-
+//
+// STRATEGY 2 — ARBITRAGE
+// 
 async function runArbStrategy(blockNumber) {
-    if (isArbScanning) {
-        console.log(`\n[arb] Block ${blockNumber} — scan still running, skipping`);
-        return;
-    }
+    if (isArbScanning) return;
     isArbScanning = true;
     try {
         await Promise.allSettled(
@@ -250,7 +260,7 @@ async function scanArbPair(pair, blockNumber) {
         );
 
         if (!profitAnalysis.isWorthIt) {
-            console.log(`[arb] Below threshold (${ARB_CONFIG.MIN_PROFIT_ETH} ETH) — skipping`);
+            console.log(`[arb] Below threshold — skipping`);
             return;
         }
 
@@ -263,18 +273,19 @@ async function scanArbPair(pair, blockNumber) {
             pair: pair.label,
         };
 
-        console.log(`[arb] SIGNAL #${stats.arbSignals} — WOULD EMIT ARB_SIGNAL`);
-        console.log(`      Tip to builder: ${profitAnalysis.recommendedTipETH} ETH`);
-        console.log(`      You keep:       ${profitAnalysis.keeperProfitETH} ETH`);
+        console.log(`[arb] Signal #${stats.arbSignals} emitted`);
+
+        // ── Issue 1 fix: real emit ────────────────────────────────
+        signalEmitter.emit("arbitrage", signal);
 
     } catch (err) {
         console.error(`\n[arb] Error scanning ${pair.label}:`, err.message);
     }
 }
 
-
-// STRATEGY 3 — BACKRUN //
-
+// 
+// STRATEGY 3 — BACKRUN
+// 
 function startBackrunWatcher() {
     console.log("[backrun] Watching mempool...");
 
@@ -300,6 +311,9 @@ function startBackrunWatcher() {
             }
 
             const valueEth = parseFloat(ethers.formatEther(tx.value)).toFixed(4);
+
+            const decoded = decodeSwapCalldata(tx.data);
+
             stats.backrunSignals++;
 
             const signal = {
@@ -310,24 +324,74 @@ function startBackrunWatcher() {
                 gasPrice: tx.maxFeePerGas?.toString() || tx.gasPrice?.toString(),
                 from: tx.from,
                 data: tx.data,
+                // decoded swap details
+                tokenIn: decoded?.tokenIn || null,
+                tokenOut: decoded?.tokenOut || null,
+                amountIn: decoded?.amountIn || null,
             };
 
-            console.log(`\n[backrun] SIGNAL #${stats.backrunSignals} — WOULD EMIT BACKRUN_TARGET`);
-            console.log(`          TxHash: ${txHash}`);
-            console.log(`          Value:  ${valueEth} ETH`);
-            console.log(`          From:   ${tx.from}`);
-            console.log(`          To:     ${tx.to}`);
-            console.log(`          Gas:    ${tx.maxFeePerGas
-                ? ethers.formatUnits(tx.maxFeePerGas, "gwei") + " gwei"
-                : "legacy"}`);
+            console.log(`\n[backrun] Signal #${stats.backrunSignals} emitted`);
+            console.log(`          TxHash:   ${txHash.slice(0, 12)}...`);
+            console.log(`          Value:    ${valueEth} ETH`);
+            console.log(`          TokenIn:  ${signal.tokenIn || "could not decode"}`);
+            console.log(`          TokenOut: ${signal.tokenOut || "could not decode"}`);
+            console.log(`          AmountIn: ${signal.amountIn || "could not decode"}`);
+
+            //emit
+            signalEmitter.emit("backrun", signal);
 
         } catch (_) { }
     });
 }
 
+function decodeSwapCalldata(data) {
+    if (!data || data.length < 10) return null;
 
-// STRATEGY 4 — PROTECTION //
+    const selector = data.slice(0, 10).toLowerCase();
 
+    try {
+        // exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))
+        if (selector === "0x414bf389") {
+            const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+            const decoded = abiCoder.decode(
+                ["tuple(address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 deadline,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96)"],
+                "0x" + data.slice(10)
+            );
+            return {
+                tokenIn: decoded[0].tokenIn,
+                tokenOut: decoded[0].tokenOut,
+                amountIn: decoded[0].amountIn.toString(),
+            };
+        }
+
+        // exactInput((bytes,address,uint256,uint256,uint256))
+        if (selector === "0xc04b8d59") {
+            const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+            const decoded = abiCoder.decode(
+                ["tuple(bytes path,address recipient,uint256 deadline,uint256 amountIn,uint256 amountOutMinimum)"],
+                "0x" + data.slice(10)
+            );
+            // path is encoded as bytes — first 20 bytes = tokenIn, last 20 bytes = tokenOut
+            const path = decoded[0].path;
+            const tokenIn = "0x" + path.slice(2, 42);
+            const tokenOut = "0x" + path.slice(path.length - 40);
+            return {
+                tokenIn,
+                tokenOut,
+                amountIn: decoded[0].amountIn.toString(),
+            };
+        }
+
+    } catch (_) {
+        return null;
+    }
+
+    return null;
+}
+
+// 
+// STRATEGY 4 — PROTECTION
+// 
 async function runProtectionStrategy(blockNumber) {
     if (protectedUsers.size === 0) return;
 
@@ -347,7 +411,6 @@ async function checkProtectionNeeded(address, blockNumber) {
         if (parsed.totalDebtUsd === 0n || parsed.healthFactor > ethers.parseUnits("1000", 18)) {
             return;
         }
-
         if (parsed.healthFactor > HF_PROTECTION_THRESHOLD) return;
 
         console.log(
@@ -369,16 +432,15 @@ async function checkProtectionNeeded(address, blockNumber) {
         const signal = {
             user: address,
             debtAsset: bestDebt.asset,
-            repayAmount: repayAmount.toString(),
-            healthFactor: formatHF(parsed.healthFactor),
+            repayAmount,
+            healthFactor: parsed.healthFactor,
             blockNumber,
         };
 
-        console.log(`[protection] SIGNAL #${stats.protectionSignals} — WOULD EMIT PROTECTION_NEEDED`);
-        console.log(`             user:        ${signal.user.slice(0, 10)}...`);
-        console.log(`             debtAsset:   ${signal.debtAsset}`);
-        console.log(`             repayAmount: ${signal.repayAmount}`);
-        console.log(`             HF:          ${signal.healthFactor}`);
+        console.log(`[protection] Signal #${stats.protectionSignals} emitted`);
+
+        //
+        signalEmitter.emit("protection", signal);
 
     } catch (err) {
         console.log(
@@ -392,9 +454,9 @@ function clearProtectionPending(address) {
     protectionPending.delete(address.toLowerCase());
 }
 
-
-// SHARED UTILS //
-
+// 
+// SHARED UTILS
+// 
 async function getUserReserves(userAddress) {
     const tokenList = Object.values(TOKENS);
     try {
@@ -425,6 +487,4 @@ async function runInBatches(promises, batchSize) {
         await Promise.allSettled(promises.slice(i, i + batchSize));
     }
 }
-
-
 createProvider();

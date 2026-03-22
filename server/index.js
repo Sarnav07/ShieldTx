@@ -16,6 +16,14 @@
  */
 
 require("dotenv").config();
+
+// If we are running the live Anvil demo, force all connections to localhost
+if (process.env.NETWORK === "mainnet") {
+    console.log("\n[demo] Overriding RPC endpoints to local Anvil fork (127.0.0.1:8545)...");
+    process.env.RPC_WSS = "ws://127.0.0.1:8545";
+    process.env.SEPOLIA_RPC_URL = "http://127.0.0.1:8545";
+}
+
 const express = require("express");
 const path = require("path");
 

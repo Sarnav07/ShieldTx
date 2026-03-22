@@ -1,0 +1,51 @@
+[dotenv@17.3.1] injecting env (9) from .env -- tip: 🛠️  run anywhere with `dotenvx run -- yourcommand`
+
+[demo] Overriding RPC endpoints to local Anvil fork (127.0.0.1:8545)...
+[dotenv@17.3.1] injecting env (0) from .env -- tip: ⚙️  enable debug logging with { debug: true }
+[tracker] Seeded 1 positions from file
+[backrun] Watching mempool...
+[watcher] Connected — all 4 strategies active
+[watcher] Watching pairs: WETH/USDC
+
+╔══════════════════════════════════════════════════╗
+║         ShieldTx MEV — Unified System           ║
+╚══════════════════════════════════════════════════╝
+
+[2026-03-22T20:57:49.605Z]  MEV Bundler initialising (integrated mode)...
+[2026-03-22T20:57:49.605Z]    Strategies: Liquidation + DEX Arbitrage
+[2026-03-22T20:57:49.605Z]    Network: Target Chain 1
+[2026-03-22T20:57:49.605Z]    Contract: 0x3035eA5eef104AAAB833ab386cD6BC0EF4Abfa93
+[2026-03-22T20:57:49.605Z]    Relay: https://relay.flashbots.net
+[2026-03-22T20:57:49.614Z]    Connected to chainId: 1
+[2026-03-22T20:57:49.630Z]    Owner wallet: 0xC7c1098B2A90e9621dAe395386521eda2321B7D2
+[2026-03-22T20:57:49.631Z]    Relay signer: 0xbA878CE906f8F09701dA1d0721fDf7be4C852c73
+[2026-03-22T20:57:49.633Z]    Connected to Flashbots relay
+[2026-03-22T20:57:56.082Z]    Owner balance: 0.0 ETH
+[2026-03-22T20:57:56.082Z]   WARNING: Owner has 0 ETH — transactions will fail!
+[2026-03-22T20:57:56.082Z] 
+ Bundler is LIVE — listening for signals from watcher...
+
+[system] Watcher + Bundler + Dashboard all running ✓
+
+node:events:502
+      throw er; // Unhandled 'error' event
+      ^
+
+Error: listen EADDRINUSE: address already in use :::3000
+    at Server.setupListenHandle [as _listen2] (node:net:1908:16)
+    at listenInCluster (node:net:1965:12)
+    at Server.listen (node:net:2067:7)
+    at Function.listen (/home/vihaan-jain/shieldTxPrivate/server/node_modules/express/lib/application.js:635:24)
+    at start (/home/vihaan-jain/shieldTxPrivate/server/index.js:65:9)
+    at process.processTicksAndRejections (node:internal/process/task_queues:95:5)
+Emitted 'error' event on Server instance at:
+    at emitErrorNT (node:net:1944:8)
+    at process.processTicksAndRejections (node:internal/process/task_queues:82:21) {
+  code: 'EADDRINUSE',
+  errno: -98,
+  syscall: 'listen',
+  address: '::',
+  port: 3000
+}
+
+Node.js v20.19.5

@@ -36,8 +36,10 @@ const { calculateArbProfit, SEPOLIA_ADDRESSES } = require("./arbCalculator");
 // Configuration
 // ---------------------------------------------------------------------------
 
-const SEPOLIA_CHAIN_ID = 11155111;
-const FLASHBOTS_RELAY_SEPOLIA = "https://relay-sepolia.flashbots.net";
+const TARGET_CHAIN_ID = process.env.NETWORK === "mainnet" ? 1 : 11155111;
+const FLASHBOTS_RELAY_SEPOLIA = process.env.NETWORK === "mainnet"
+    ? "https://relay.flashbots.net"
+    : "https://relay-sepolia.flashbots.net";
 
 // Load ABI from Person A's config (shared file)
 const ABI_PATH = path.resolve(__dirname, "../../aave-flashbot-bot/config/abi.json");
@@ -45,6 +47,19 @@ const ABI = JSON.parse(fs.readFileSync(ABI_PATH, "utf-8"));
 
 // Gas settings
 const GAS_LIMIT = 600_000;
+
+function getDynamicContractAddress() {
+    if (process.env.NETWORK === "mainnet") {
+        try {
+            const demoPath = require("path").resolve(__dirname, "../../.demo-contract.json");
+            const cd = JSON.parse(require("fs").readFileSync(demoPath, "utf-8"));
+            return cd.contractAddress;
+        } catch {
+            return CONTRACT_ADDRESS;
+        }
+    }
+    return CONTRACT_ADDRESS;
+}
 const PRIORITY_FEE_GWEI = "2"; // 2 gwei priority fee
 
 // ---------------------------------------------------------------------------
@@ -254,12 +269,12 @@ async function buildAndSendBundle(
             {
                 signer: wallet,
                 transaction: {
-                    to: CONTRACT_ADDRESS,
+                    to: getDynamicContractAddress(),
                     data: calldata,
                     gasLimit: GAS_LIMIT,
                     maxFeePerGas: maxFeePerGas,
                     maxPriorityFeePerGas: priorityFee,
-                    chainId: SEPOLIA_CHAIN_ID,
+                    chainId: TARGET_CHAIN_ID,
                     type: 2,
                 },
             },
@@ -271,7 +286,7 @@ async function buildAndSendBundle(
             try {
                 const signedBundle = await flashbotsProvider.signBundle(bundleTransactions);
                 for (const signedTx of signedBundle) {
-                    const txResponse = await provider.sendTransaction(signedTx);
+                    const txResponse = await provider.broadcastTransaction(signedTx);
                     const receipt = await txResponse.wait();
                     log(`   Tx mined in block ${receipt.blockNumber} (Gas: ${receipt.gasUsed})`);
                     lastHash = txResponse.hash;
@@ -410,12 +425,12 @@ async function buildAndSendBackrunBundle(
             {
                 signer: wallet,
                 transaction: {
-                    to: CONTRACT_ADDRESS,
+                    to: getDynamicContractAddress(),
                     data: calldata,
                     gasLimit: GAS_LIMIT,
                     maxFeePerGas: maxFeePerGas,
                     maxPriorityFeePerGas: priorityFee,
-                    chainId: SEPOLIA_CHAIN_ID,
+                    chainId: TARGET_CHAIN_ID,
                     type: 2,
                 },
             },
@@ -427,7 +442,7 @@ async function buildAndSendBackrunBundle(
             try {
                 const signedBundle = await flashbotsProvider.signBundle(bundleTransactions);
                 for (const signedTx of signedBundle) {
-                    const txResponse = await provider.sendTransaction(signedTx);
+                    const txResponse = await provider.broadcastTransaction(signedTx);
                     const receipt = await txResponse.wait();
                     log(`   Tx mined in block ${receipt.blockNumber} (Gas: ${receipt.gasUsed})`);
                     lastHash = txResponse.hash;
@@ -662,7 +677,7 @@ async function handleBackrunSignal(signal, wallet, provider, flashbotsProvider) 
 async function initBundler() {
     log(" MEV Bundler initialising (integrated mode)...");
     log(`   Strategies: Liquidation + DEX Arbitrage`);
-    log(`   Network: Sepolia (chain ${SEPOLIA_CHAIN_ID})`);
+    log(`   Network: Target Chain ${TARGET_CHAIN_ID}`);
     log(`   Contract: ${CONTRACT_ADDRESS}`);
     log(`   Relay: ${FLASHBOTS_RELAY_SEPOLIA}`);
 
@@ -680,8 +695,8 @@ async function initBundler() {
     const network = await provider.getNetwork();
     log(`   Connected to chainId: ${network.chainId}`);
 
-    if (Number(network.chainId) !== SEPOLIA_CHAIN_ID) {
-        log(`Wrong network! Expected Sepolia (${SEPOLIA_CHAIN_ID}), got ${network.chainId}`);
+    if (Number(network.chainId) !== TARGET_CHAIN_ID) {
+        log(`Wrong network! Expected Target Chain (${TARGET_CHAIN_ID}), got ${network.chainId}`);
         process.exit(1);
     }
 
@@ -702,6 +717,14 @@ async function initBundler() {
     log(`   Connected to Flashbots relay`);
 
     // Check owner balance
+    if (process.env.NETWORK === "mainnet") {
+        log(`   [demo] Auto-funding wallet with 100 fake ETH on Anvil...`);
+        try {
+            await provider.send("anvil_setBalance", [ownerWallet.address, "0x56BC75E2D63100000"]); // 100 ETH represented in hex Wei
+        } catch (e) {
+            log(`   [demo] Failed to auto-fund: ${e.message}`);
+        }
+    }
     const balance = await provider.getBalance(ownerWallet.address);
     log(`   Owner balance: ${ethers.formatEther(balance)} ETH`);
 
@@ -733,7 +756,7 @@ async function initBundler() {
 async function main() {
     log(" MEV Bundler starting (standalone mode)...");
     log(`   Strategies: Liquidation + DEX Arbitrage`);
-    log(`   Network: Sepolia (chain ${SEPOLIA_CHAIN_ID})`);
+    log(`   Network: Target Chain ${TARGET_CHAIN_ID}`);
     log(`   Contract: ${CONTRACT_ADDRESS}`);
     log(`   Relay: ${FLASHBOTS_RELAY_SEPOLIA}`);
 
@@ -751,8 +774,8 @@ async function main() {
     const network = await provider.getNetwork();
     log(`   Connected to chainId: ${network.chainId}`);
 
-    if (Number(network.chainId) !== SEPOLIA_CHAIN_ID) {
-        log(`Wrong network! Expected Sepolia (${SEPOLIA_CHAIN_ID}), got ${network.chainId}`);
+    if (Number(network.chainId) !== TARGET_CHAIN_ID) {
+        log(`Wrong network! Expected Target Chain (${TARGET_CHAIN_ID}), got ${network.chainId}`);
         process.exit(1);
     }
 
@@ -773,6 +796,14 @@ async function main() {
     log(`   Connected to Flashbots relay`);
 
     // Check owner balance
+    if (process.env.NETWORK === "mainnet") {
+        log(`   [demo] Auto-funding wallet with 100 fake ETH on Anvil...`);
+        try {
+            await provider.send("anvil_setBalance", [ownerWallet.address, "0x56BC75E2D63100000"]); // 100 ETH represented in hex Wei
+        } catch (e) {
+            log(`   [demo] Failed to auto-fund: ${e.message}`);
+        }
+    }
     const balance = await provider.getBalance(ownerWallet.address);
     log(`   Owner balance: ${ethers.formatEther(balance)} ETH`);
 
@@ -801,7 +832,20 @@ async function main() {
         setTimeout(() => emitMockLiquidationSignal(), 2000);
     }
     if (process.env.MOCK_ARB === "true") {
-        setTimeout(() => emitMockArbSignal(), 2000);
+        setTimeout(async () => {
+            const { findArbOpportunity } = require("./arbCalculator");
+            const ADDR = {
+                WETH: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+                USDC: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+            };
+            const opp = await findArbOpportunity(provider, ADDR.WETH, ADDR.USDC);
+            if (opp) {
+                const { toArbSignal } = require("./arbCalculator"); // ensure exported
+                signalBus.emit("arbitrage", toArbSignal(opp));
+            } else {
+                log("   [demo] No arb opportunity found to mock!");
+            }
+        }, 2000);
     }
     if (process.env.MOCK_BACKRUN === "true") {
         setTimeout(() => emitMockBackrunSignal(), 2000);

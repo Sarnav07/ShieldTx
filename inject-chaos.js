@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { ethers } = require('ethers'); // Using ethers v5
+require("dotenv").config({ path: path.join(__dirname, "server", ".env") });
 
 const FORK_URL = "http://127.0.0.1:8545";
 const WHALE = "0x0000000000000000000000000000000000001337";
@@ -52,7 +53,12 @@ async function main() {
         process.exit(1);
     }
     const compiled = JSON.parse(fs.readFileSync(artifactPath, "utf-8"));
-    const factory = new ethers.ContractFactory(compiled.abi, compiled.bytecode.object, whaleSigner);
+
+    // Deploy using the actual bot wallet so the bot is the 'owner'
+    const botWallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+    await provider.send("anvil_setBalance", [botWallet.address, ethers.utils.hexValue(ethers.utils.parseEther("100"))]);
+
+    const factory = new ethers.ContractFactory(compiled.abi, compiled.bytecode.object, botWallet);
     const contract = await factory.deploy(ADDR.AAVE_POOL, ADDR.UNISWAP_ROUTER);
     await contract.deployed();
     const contractAddress = contract.address;

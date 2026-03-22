@@ -555,10 +555,8 @@
     <script>
         const API_URL = "/api/status";
         const POLL_INTERVAL = 2000;
-        const CONTRACT = "0x847335923C5D3d70791349E3b5d3Ed65739758c2";
-
-        document.getElementById("contractAddr").textContent =
-            CONTRACT.slice(0, 6) + "..." + CONTRACT.slice(-4);
+        
+        document.getElementById("contractAddr").textContent = "Loading...";
 
         function formatUptime(seconds) {
             const h = Math.floor(seconds / 3600);
@@ -631,6 +629,11 @@
                 } else {
                     badge.className = "status-badge offline";
                     badge.innerHTML = '<span class="pulse"></span> OFFLINE';
+                }
+                
+                if (data.contractAddress) {
+                    document.getElementById("contractAddr").textContent =
+                        data.contractAddress.slice(0, 6) + "..." + data.contractAddress.slice(-4);
                 }
 
                 document.getElementById("currentBlock").textContent =

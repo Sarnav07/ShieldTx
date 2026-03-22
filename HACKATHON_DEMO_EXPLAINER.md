@@ -1,4 +1,30 @@
-# The Ultimate Hackathon Demo: How It Works under the Hood
+# The Ultimate Hackathon Demo
+
+## Quick Start: How to Run the Live Demo
+You need exactly 3 terminal windows to run this successfully.
+
+**Terminal 1: Start the Blockchain**
+```bash
+anvil --fork-url https://mainnet.infura.io/v3/eab4495632284c1b82d7c680dd87eb42 --port 8545
+```
+*(Leave this running in the background)*
+
+**Terminal 2: Start the Backend & Dashboard**
+```bash
+cd server
+NETWORK=mainnet DEMO_BYPASS_FLASHBOTS=true node index.js
+```
+*(Open http://localhost:3000 to see the Dashboard)*
+
+**Terminal 3: Inject the Chaos (The Whale Simulator)**
+```bash
+node inject-chaos.js
+```
+*(As soon as you enter this, watch your Dashboard and Terminal 2 light up as the bot spots the 200 ETH price crash, builds the bundle, and executes the Flashbots transaction!)*
+
+---
+
+## How It Works under the Hood
 
 This document explains the technical architecture of the live network demo. It is designed to help you confidently answer questions from judges about what is "real" and what is "simulated" in your presentation.
 

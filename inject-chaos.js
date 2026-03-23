@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { ethers } = require('ethers'); // Using ethers v5
+const { ethers } = require('ethers');
 require("dotenv").config({ path: path.join(__dirname, "server", ".env") });
 
 const FORK_URL = "http://127.0.0.1:8545";
@@ -29,14 +29,14 @@ const AAVE_POOL_ABI = [
 ];
 
 async function main() {
-    console.log(`\n🔥 SHIELDTX - LIVE NETWORK CHAOS INJECTOR 🔥`);
+    console.log(`\nSHIELDTX - LIVE NETWORK CHAOS INJECTOR `);
 
     let provider;
     try {
         provider = new ethers.providers.JsonRpcProvider(FORK_URL);
         await provider.getBlockNumber();
     } catch (e) {
-        console.error("❌ Anvil is not running! Start it: anvil --fork-url $MAINNET_RPC_URL");
+        console.error("Anvil is not running! Start it: anvil --fork-url $MAINNET_RPC_URL");
         process.exit(1);
     }
 
@@ -49,7 +49,7 @@ async function main() {
     console.log("\n[1] Deploying AaveLiquidator smart contract to Anvil fork...");
     const artifactPath = path.join(__dirname, "aave-flashbot-bot/out/AaveLiquidator.sol/AaveLiquidator.json");
     if (!fs.existsSync(artifactPath)) {
-        console.error("❌ Need to compile contract first: cd aave-flashbot-bot && forge build");
+        console.error(" Need to compile contract first: cd aave-flashbot-bot && forge build");
         process.exit(1);
     }
     const compiled = JSON.parse(fs.readFileSync(artifactPath, "utf-8"));
@@ -62,7 +62,7 @@ async function main() {
     const contract = await factory.deploy(ADDR.AAVE_POOL, ADDR.UNISWAP_ROUTER);
     await contract.deployed();
     const contractAddress = contract.address;
-    console.log(`✅ AaveLiquidator deployed at: ${contractAddress}`);
+    console.log(`AaveLiquidator deployed at: ${contractAddress}`);
 
     // Update config to use this address for the demo
     fs.writeFileSync(path.join(__dirname, ".demo-contract.json"), JSON.stringify({ contractAddress }));
@@ -77,7 +77,7 @@ async function main() {
     const sushi = new ethers.Contract(ADDR.SUSHI_ROUTER, SUSHI_ABI, whaleSigner);
     const deadline = Math.floor(Date.now() / 1000) + 600;
     await sushi.swapExactTokensForTokens(WHALE_SWAP, 0, [ADDR.WETH, ADDR.USDC], WHALE, deadline);
-    console.log(`✅ Whale dumped 200 WETH on SushiV2 — Price crashed!`);
+    console.log(`Whale dumped 200 WETH on SushiV2 — Price crashed!`);
 
     // 4. Create a toxic Aave loan to trigger Liquidation
     console.log("\n[3] Injecting Liquidation Opportunity (Aave V3 Toxic Loan)...");
@@ -95,10 +95,10 @@ async function main() {
 
     const newAccountData = await pool.getUserAccountData(WHALE);
     const hf = parseFloat(ethers.utils.formatUnits(newAccountData.healthFactor, 18)).toFixed(4);
-    console.log(`✅ Whale borrowed USDC on Aave. Health Factor = ${hf}`);
+    console.log(`Whale borrowed USDC on Aave. Health Factor = ${hf}`);
 
-    console.log("\n🎉 Chaos successfully injected into the Anvil blockchain!");
-    console.log("👉 The ShieldTx backend watcher should detect these immediately.\n");
+    console.log("\nChaos successfully injected into the Anvil blockchain!");
+    console.log("The ShieldTx backend watcher should detect these immediately.\n");
 }
 
 main().catch(console.error);

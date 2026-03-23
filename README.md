@@ -402,7 +402,13 @@ cp server/.env.example server/.env
 cd server && node index.js
 # → Starts watcher + bundler + dashboard on port 3000
 
-# 4. (Alternative) Run the demo with mock signals
+# 4. The Ultimate Hackathon Demo (Live Fork)
+For the most visually impressive demonstration of the bot working against live Uniswap/Aave liquidity without risking real funds, please refer exclusively to:
+👉 [HACKATHON_DEMO_EXPLAINER.md](./HACKATHON_DEMO_EXPLAINER.md)
+
+# 5. (Alternative) Local Testing with Mock Signals
+If you do not want to run an Anvil fork, you can test the dashboard by forcing hardcoded JSON signals into the bundler pipeline:
+```bash
 cd server && MOCK_MODE=true MOCK_ARB=true MOCK_BACKRUN=true node index.js
 ```
 

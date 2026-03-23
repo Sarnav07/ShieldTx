@@ -18,6 +18,7 @@ NETWORK=mainnet DEMO_BYPASS_FLASHBOTS=true node index.js
 
 **Terminal 3: Inject the Chaos (The Whale Simulator)**
 ```bash
+npm install ethers dotenv
 node inject-chaos.js
 ```
 *(As soon as you enter this, watch your Dashboard and Terminal 2 light up as the bot spots the 200 ETH price crash, builds the bundle, and executes the Flashbots transaction!)*
@@ -25,8 +26,6 @@ node inject-chaos.js
 ---
 
 ## How It Works under the Hood
-
-This document explains the technical architecture of the live network demo. It is designed to help you confidently answer questions from judges about what is "real" and what is "simulated" in your presentation.
 
 ## 1. The Setup: The Anvil Mainnet Fork
 `anvil --fork-url https://mainnet.infura.io...`
@@ -68,12 +67,10 @@ The `bundler.js` process catches the `arbitrage` event and executes the followin
 
 ---
 
-## 4. Summary for Judges
-
-If asked, you can confidently explain the limits of the simulation:
+## 4. Summary 
 
 **WHAT IS 100% REAL:**
-* **The On-Chain Math:** Your Node.js backend queries real Uniswap quoting contracts to determine profitability.
+* **The On-Chain Math:** Our Node.js backend queries real Uniswap quoting contracts to determine profitability.
 * **The Architecture:** The event-driven Watcher -> Emitter -> Bundler Node.js pipeline is exactly how production MEV bots are structured.
 * **The Solidity Execution:** The `AaveLiquidator.sol` contract genuinely executes the multi-leg flash-loan arbitrage on the local fork, paying simulated gas and updating its internal ETH balance.
 * **The Dashboard:** The UI updates are driven by genuine backend events, not hardcoded strings.

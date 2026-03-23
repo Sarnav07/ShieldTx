@@ -2,18 +2,23 @@
 broadcast/
 cache/
 out/
+lib/
 
 # Environment variables (Crucial for keeping your private keys safe!)
 .env
+.env.*
+!.env.example
 
-# Node dependencies (if you are using any npm packages)
+# Node dependencies
 node_modules/
+package-lock.json
 
-aave-flashbot-bot/broadcast/
-aave-flashbot-bot/out/
-aave-flashbot-bot/cache/
-.env
-
-aave-flashbot-bot/lib/
-
+# Demo artifacts and logs
 .demo-contract.json
+anvil_temp.log
+*.log
+
+# IDEs and Misc
+.vscode/
+.idea/
+.DS_Store

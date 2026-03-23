@@ -1,7 +1,51 @@
 # The Ultimate Hackathon Demo
 
-## Quick Start: How to Run the Live Demo
-You need exactly 3 terminal windows to run this successfully.
+## 🛠️ Step 0: Prerequisites & Setup
+
+Before running the demo, ensure you have **Node.js (v18+)**, **Foundry**, and **Git** installed on your system.
+
+**1. Install Dependencies**
+```bash
+# Root: Install injector script dependencies
+npm install ethers dotenv
+
+# Server: Install watcher & math dependencies
+cd server
+npm install ethers dotenv
+
+# Bundler: Install Flashbots & UI runtime dependencies
+cd ../flashbot-bundler
+npm install @flashbots/ethers-provider-bundle ethers dotenv express
+
+# Contracts: Install Solidity framework libraries
+cd ../aave-flashbot-bot
+forge install foundry-rs/forge-std aave/aave-v3-core OpenZeppelin/openzeppelin-contracts
+forge build
+cd ..
+```
+
+**2. Configure your Environment Variables**
+The backend and the injector script require a `.env` file located natively inside the `server/` folder.
+
+Create a file named `server/.env` and paste the following:
+```env
+# Network Endpoints
+RPC_WSS=wss://sepolia.infura.io/ws/v3/YOUR_INFURA_KEY
+SEPOLIA_RPC_URL=https://sepolia.infura.io/v3/YOUR_INFURA_KEY
+
+# Wallets
+PRIVATE_KEY=your_real_wallet_private_key
+FLASHBOTS_AUTH_KEY=0x9000000000000000000000000000000000000011 # This can be any random 32-byte hex for reputation tracking
+
+# UI
+DASHBOARD_PORT=3000
+```
+*(For the local Anvil fork demo, your real `PRIVATE_KEY` doesn't strictly need real Mainnet ETH because the chaos injector artificially funds it. However, it must be a valid 64-character EVM private key).*
+
+---
+
+## 🚀 Quick Start: How to Run the Live Demo
+You need exactly 3 terminal windows to execute the full architecture seamlessly.
 
 **Terminal 1: Start the Blockchain**
 ```bash
@@ -18,10 +62,10 @@ NETWORK=mainnet DEMO_BYPASS_FLASHBOTS=true node index.js
 
 **Terminal 3: Inject the Chaos (The Whale Simulator)**
 ```bash
-npm install ethers dotenv
+# Make sure you are in the root ShieldTx directory
 node inject-chaos.js
 ```
-*(As soon as you enter this, watch your Dashboard and Terminal 2 light up as the bot spots the 200 ETH price crash, builds the bundle, and executes the Flashbots transaction!)*
+*(As soon as you execute this, immediately look at your Dashboard and Terminal 2! You will watch the bot detect the 200 ETH price crash, parse the mathematical spread, and route the Flashbots bundle on-chain!)*
 
 ---
 

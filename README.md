@@ -391,12 +391,20 @@ shieldTxPrivate/
 
 ```bash
 # 1. Install dependencies
-cd server && npm install
-cd ../flashbot-bundler && npm install
+npm install ethers dotenv
+cd server && npm install ethers dotenv
+cd ../flashbot-bundler && npm install @flashbots/ethers-provider-bundle ethers dotenv express
+cd ../aave-flashbot-bot && forge install foundry-rs/forge-std aave/aave-v3-core OpenZeppelin/openzeppelin-contracts
 
 # 2. Configure environment
-cp server/.env.example server/.env
-# Edit .env with your Sepolia RPC URLs and keys
+Create a `server/.env` file and insert the following keys:
+```env
+RPC_WSS=wss://sepolia.infura.io/ws/v3/YOUR_INFURA_KEY
+SEPOLIA_RPC_URL=https://sepolia.infura.io/v3/YOUR_INFURA_KEY
+PRIVATE_KEY=your_real_wallet_private_key
+FLASHBOTS_AUTH_KEY=0x9000000000000000000000000000000000000011 # Optional reputation key
+DASHBOARD_PORT=3000
+```
 
 # 3. Run the full system
 cd server && node index.js

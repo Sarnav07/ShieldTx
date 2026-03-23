@@ -16,7 +16,7 @@ all: clean install build
 clean  :; forge clean
 
 # Install dependencies
-install :; forge install
+install :; forge install foundry-rs/forge-std aave/aave-v3-core OpenZeppelin/openzeppelin-contracts
 
 # Update Dependencies
 update:; forge update

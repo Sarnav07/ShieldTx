@@ -93,12 +93,12 @@ async function main() {
 
     const accountData = await pool.getUserAccountData(WHALE);
     const borrowBase = accountData.availableBorrowsBase * 98n / 100n; // Borrow 98% to be extremely close to 1.0 HF
-    
+
     // Convert base to USDC decimals (base is 8 decimals via Oracle, USDC is 6)
     // Actually, Aave v3 availableBorrowsBase is exactly base currency (8 decimals). USDC is 6 decimals.
     // 1 base unit ($1.00) = 1e8. We want 1e6. So divide by 100.
     const borrowUSDC = borrowBase / 100n;
-    
+
     await pool.borrow(ADDR.USDC, borrowUSDC, 2, 0, WHALE, { from: WHALE });
 
     const newAccountData = await pool.getUserAccountData(WHALE);

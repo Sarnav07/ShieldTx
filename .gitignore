@@ -15,3 +15,5 @@ aave-flashbot-bot/cache/
 .env
 
 aave-flashbot-bot/lib/
+
+.demo-contract.json
